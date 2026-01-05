@@ -350,7 +350,6 @@ bool AudioDecoder::open(const std::string& url) {
                 m_trackInfo.duration = av_rescale_q(audioStream->duration,
                                                     audioStream->time_base,
                                                     {1, (int)m_trackInfo.sampleRate});
-            } else {
             }
 
             m_eof = false;
@@ -1173,9 +1172,6 @@ double AudioEngine::getPosition() const {
 }
 
 bool AudioEngine::process(size_t samplesNeeded) {
-    // Vérification rapide sans mutex
-    State currentState = m_state.load();
-
     // CRITICAL: Process async seek request (lock-free check)
     // This runs in the audio thread, so we can safely take the mutex
     if (m_seekRequested.load(std::memory_order_acquire)) {

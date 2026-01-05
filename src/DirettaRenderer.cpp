@@ -177,7 +177,35 @@ bool DirettaRenderer::start() {
                 // Open/resume connection if needed
                 // Check isPlaying() not isOpen() - after stopPlayback(), isOpen() is true
                 // but we still need to call open() to trigger quick resume
-                if (!m_direttaSync->isPlaying()) {
+                //
+                // CRITICAL FIX: Also check for format changes!
+                // When transitioning DSD→PCM (or vice versa), DirettaSync may still be
+                // "playing" but with the wrong format. We must call open() to reconfigure.
+                bool needsOpen = !m_direttaSync->isPlaying();
+
+                if (!needsOpen && m_direttaSync->isOpen()) {
+                    // Check if format has changed
+                    const AudioFormat& currentSyncFormat = m_direttaSync->getFormat();
+                    bool formatChanged = (currentSyncFormat.sampleRate != format.sampleRate ||
+                                         currentSyncFormat.bitDepth != format.bitDepth ||
+                                         currentSyncFormat.channels != format.channels ||
+                                         currentSyncFormat.isDSD != format.isDSD);
+                    if (formatChanged) {
+                        std::cout << "[Callback] FORMAT CHANGE DETECTED!" << std::endl;
+                        std::cout << "[Callback]   Old: " << currentSyncFormat.sampleRate << "Hz/"
+                                  << currentSyncFormat.bitDepth << "bit "
+                                  << (currentSyncFormat.isDSD ? "DSD" : "PCM") << std::endl;
+                        std::cout << "[Callback]   New: " << format.sampleRate << "Hz/"
+                                  << format.bitDepth << "bit "
+                                  << (format.isDSD ? "DSD" : "PCM") << std::endl;
+
+                        // Stop current playback to trigger full reopen
+                        m_direttaSync->stopPlayback(true);
+                        needsOpen = true;
+                    }
+                }
+
+                if (needsOpen) {
                     if (!m_direttaSync->open(format)) {
                         std::cerr << "[Callback] Failed to open DirettaSync" << std::endl;
                         return false;
@@ -282,8 +310,7 @@ bool DirettaRenderer::start() {
 
             // Auto-stop if playing
             if (currentState == AudioEngine::State::PLAYING ||
-                currentState == AudioEngine::State::PAUSED ||
-                currentState == AudioEngine::State::TRANSITIONING) {
+                currentState == AudioEngine::State::PAUSED) {
 
                 std::cout << "[DirettaRenderer] Auto-STOP before URI change" << std::endl;
 

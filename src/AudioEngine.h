@@ -2,7 +2,6 @@
 #define AUDIO_ENGINE_H
 
 #include <string>
-#include <queue>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -125,12 +124,6 @@ private:
     // multiple AudioDecoder instances run concurrently (e.g., gapless preload)
     int m_readCallCount = 0;              // readSamples() call counter
     int m_packetCount = 0;                // DSD packet counter
-    bool m_dsdWarningShown = false;       // DSD packet size warning (once per instance)
-    bool m_interleavingLoggedDOP = false; // DSD-over-PCM interleaving logged
-    bool m_interleavingLoggedNative = false; // Native DSD interleaving logged
-    bool m_dumpedFirstPacket = false;     // First packet hex dump flag
-    bool m_bitReversalLogged = false;     // Bit reversal logged (PCM mode)
-    bool m_resamplingLogged = false;      // Resampling logged (PCM mode)
     bool m_resamplerInitLogged = false;   // Resampler init logged (open())
 
     bool initResampler(uint32_t outputRate, uint32_t outputBits);
@@ -150,8 +143,7 @@ public:
     enum class State {
         STOPPED,
         PLAYING,
-        PAUSED,
-        TRANSITIONING
+        PAUSED
     };
 
     /**
@@ -292,7 +284,6 @@ public:
 private:
     std::atomic<State> m_state;
     std::atomic<int> m_trackNumber;
-    std::atomic<bool> m_pauseRequested{false};
 
     // Current and next track
     std::string m_currentURI;
