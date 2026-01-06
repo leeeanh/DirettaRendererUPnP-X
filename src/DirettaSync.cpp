@@ -310,7 +310,6 @@ bool DirettaSync::open(const AudioFormat& format) {
             m_ringBuffer.clear();
             m_prefillComplete = false;
             m_stopRequested = false;
-            m_draining = false;  // CRITICAL: Reset draining flag or sendAudio() will reject data
             play();
             m_playing = true;
             m_paused = false;
@@ -824,9 +823,22 @@ void DirettaSync::pausePlayback() {
 void DirettaSync::resumePlayback() {
     if (!m_paused) return;
 
+    DIRETTA_LOG("Resuming from pause...");
+
+    // Reset flags set during pausePlayback()
+    m_draining = false;
+    m_stopRequested = false;
+    m_silenceBuffersRemaining = 0;
+
+    // Clear stale buffer data and require fresh prefill
+    m_ringBuffer.clear();
+    m_prefillComplete = false;
+
     play();
     m_paused = false;
     m_playing = true;
+
+    DIRETTA_LOG("Resumed - buffer cleared, waiting for prefill");
 }
 
 //=============================================================================
