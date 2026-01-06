@@ -306,10 +306,23 @@ bool DirettaSync::open(const AudioFormat& format) {
 
         if (sameFormat) {
             std::cout << "[DirettaSync] Same format - quick resume (no setSink)" << std::endl;
-            // Light reset - just clear buffer and reset flags, don't stop workers
+
+            // Send silence before transition to flush Diretta pipeline
+            if (m_isDsdMode) {
+                requestShutdownSilence(30);
+                auto start = std::chrono::steady_clock::now();
+                while (m_silenceBuffersRemaining.load(std::memory_order_acquire) > 0) {
+                    if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) break;
+                    std::this_thread::yield();
+                }
+            }
+
+            // Clear buffer and reset flags
             m_ringBuffer.clear();
             m_prefillComplete = false;
             m_stopRequested = false;
+            m_draining = false;
+            m_silenceBuffersRemaining = 0;
             play();
             m_playing = true;
             m_paused = false;
@@ -486,14 +499,25 @@ bool DirettaSync::reopenForFormatChange() {
     DIRETTA_LOG("reopenForFormatChange: sending silence before format switch...");
 
     // Send silence buffers to let DAC mute gracefully before format change
-    // More silence for DSD to prevent loud cracks
-    int silenceBuffers = m_isDsdMode ? 100 : 30;
+    // Scale silence with DSD rate - higher rates need more buffers for same duration
+    int silenceBuffers = 30;  // PCM default
+    if (m_isDsdMode) {
+        // Calculate DSD multiplier from sample rate (DSD64=64, DSD128=128, etc.)
+        int dsdMultiplier = m_previousFormat.sampleRate / 44100;
+        // Base 100 buffers for DSD64, scale up for higher rates
+        // DSD64: 100, DSD128: 200, DSD256: 400, DSD512: 800
+        silenceBuffers = 100 * (dsdMultiplier / 64);
+        if (silenceBuffers < 100) silenceBuffers = 100;
+        if (silenceBuffers > 1000) silenceBuffers = 1000;
+        DIRETTA_LOG("DSD" << dsdMultiplier << " -> silence buffers: " << silenceBuffers);
+    }
     requestShutdownSilence(silenceBuffers);
 
-    // Wait for silence to be sent
+    // Wait for silence to be sent - scale timeout with buffer count
+    int timeoutMs = std::max(300, silenceBuffers * 2);
     auto start = std::chrono::steady_clock::now();
     while (m_silenceBuffersRemaining.load(std::memory_order_acquire) > 0) {
-        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(300)) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(timeoutMs)) {
             DIRETTA_LOG("Silence timeout in reopenForFormatChange");
             break;
         }
