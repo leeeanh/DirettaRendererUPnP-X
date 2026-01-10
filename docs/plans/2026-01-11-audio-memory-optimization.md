@@ -218,6 +218,7 @@ Add to `src/memcpyfast_audio.h` after the existing includes:
 #include <immintrin.h>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 
 /**
  * Consistent-timing memcpy for audio buffers (128-4096 bytes)
@@ -1017,15 +1018,29 @@ private:
         // Process 4-byte groups
         for (size_t i = 0; i < bytesPerChannel; i += 4) {
             for (int ch = 0; ch < numChannels; ch++) {
+                // Collect 4 bytes for this channel
+                uint8_t group[4];
                 for (int j = 0; j < 4 && (i + j) < bytesPerChannel; j++) {
                     uint8_t b = src[ch * bytesPerChannel + i + j];
                     if (bitReversalTable) b = bitReversalTable[b];
-                    dst[outputBytes++] = b;
+                    group[j] = b;
+                }
+
+                // Apply byte swap if needed (reverse order within 4-byte group)
+                if (needByteSwap) {
+                    dst[outputBytes++] = group[3];
+                    dst[outputBytes++] = group[2];
+                    dst[outputBytes++] = group[1];
+                    dst[outputBytes++] = group[0];
+                } else {
+                    dst[outputBytes++] = group[0];
+                    dst[outputBytes++] = group[1];
+                    dst[outputBytes++] = group[2];
+                    dst[outputBytes++] = group[3];
                 }
             }
         }
 
-        (void)needByteSwap;  // TODO: implement byte swap for scalar path
         return outputBytes;
     }
 
