@@ -61,8 +61,8 @@ alignas(64) uint8_t m_stagingDSD[STAGING_SIZE];
 
 **Why 64KB per buffer:**
 - Fits in Zen 4 L2 cache (1MB per core)
-- Covers ~340ms of 192kHz/24-bit stereo audio
-- Large enough for any realistic single push operation
+- Covers ~57ms of 192kHz/24-bit stereo audio (1.15MB/s)
+- Typical push operations are 180 bytes - 1.5KB (~1ms), so 64KB provides 40-350× headroom
 - Power of 2 for efficient indexing
 
 **Memory layout benefits:**
@@ -254,8 +254,8 @@ for (size_t i = 0; i < numBlocks; i++) {
         _mm_prefetch(src + (i + 2) * 32, _MM_HINT_T0);
     }
 
-    // Process current block
-    __m256i data = _mm256_load_si256((const __m256i*)(src + i * 32));
+    // Process current block (unaligned load - input buffers have no alignment guarantee)
+    __m256i data = _mm256_loadu_si256((const __m256i*)(src + i * 32));
     // ... conversion ...
 }
 ```
@@ -432,3 +432,6 @@ A: Executes same instruction count regardless of exact size, eliminating timing 
 
 **Q: Why prefetch 2 iterations ahead?**
 A: Matches Zen 4 L2 latency (~12 cycles) with conversion loop timing, ensuring data arrives before needed.
+
+**Q: Why use unaligned loads (`_mm256_loadu_si256`) for input?**
+A: Input buffers from AudioEngine have no alignment guarantee. Using aligned loads would cause SIGBUS/GPF on unaligned data. On modern CPUs (Haswell+, Zen+), unaligned loads have no penalty when data is naturally aligned, so there's no performance cost.
