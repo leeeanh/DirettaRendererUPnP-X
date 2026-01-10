@@ -433,7 +433,7 @@ private:
 A: Eliminates contention and ensures each format path has predictable cache residency.
 
 **Q: Why 64KB staging size?**
-A: Covers 340ms of 192kHz/24-bit audio, fits L2 cache, power of 2 for alignment.
+A: Covers ~57ms of 192kHz/24-bit audio (1.15MB/s), which is 40-350× larger than typical push sizes (180B-1.5KB). Fits L2 cache, power of 2 for alignment.
 
 **Q: Why overlapping stores for tail handling?**
 A: Executes same instruction count regardless of exact size, eliminating timing variance from the 256-case jump table.
