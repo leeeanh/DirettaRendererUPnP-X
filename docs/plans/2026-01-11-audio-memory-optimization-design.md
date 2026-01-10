@@ -293,25 +293,33 @@ _mm256_storeu_si256(dst + 32, out1);
 
 **DSD planar-to-interleaved optimization:**
 
+Note: SIMD path is for **stereo only** (2 channels). Multi-channel DSD (4/6 channels) uses scalar fallback to preserve correct channel ordering.
+
 ```cpp
-// Process 32 bytes (8 × 4-byte groups) per iteration
-__m256i left  = _mm256_loadu_si256(src_L);
-__m256i right = _mm256_loadu_si256(src_R);
+// STEREO SIMD PATH: Process 32 bytes (8 × 4-byte groups) per iteration
+if (numChannels == 2) {
+    __m256i left  = _mm256_loadu_si256(src_L);
+    __m256i right = _mm256_loadu_si256(src_R);
 
-// Interleave 4-byte groups: [L0 R0 L1 R1 L2 R2 L3 R3]
-__m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
-__m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
+    // Interleave 4-byte groups: [L0 R0 L1 R1 L2 R2 L3 R3]
+    __m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
+    __m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
 
-// Apply bit reversal if needed (vectorized table lookup)
-if (needBitReversal) {
-    interleaved_lo = simd_bit_reverse(interleaved_lo);
-    interleaved_hi = simd_bit_reverse(interleaved_hi);
-}
+    // Apply bit reversal if needed (vectorized table lookup)
+    if (needBitReversal) {
+        interleaved_lo = simd_bit_reverse(interleaved_lo);
+        interleaved_hi = simd_bit_reverse(interleaved_hi);
+    }
 
-// Byte swap for little-endian targets
-if (needByteSwap) {
-    interleaved_lo = _mm256_shuffle_epi8(interleaved_lo, byteswap_mask);
-    interleaved_hi = _mm256_shuffle_epi8(interleaved_hi, byteswap_mask);
+    // Byte swap for little-endian targets
+    if (needByteSwap) {
+        interleaved_lo = _mm256_shuffle_epi8(interleaved_lo, byteswap_mask);
+        interleaved_hi = _mm256_shuffle_epi8(interleaved_hi, byteswap_mask);
+    }
+} else {
+    // MULTI-CHANNEL FALLBACK: Use existing scalar loop for 4/6+ channels
+    // Maintains correct channel ordering for surround DSD
+    convertDSDPlanar_Scalar(dst, src, numChannels, ...);
 }
 ```
 
@@ -435,3 +443,6 @@ A: Matches Zen 4 L2 latency (~12 cycles) with conversion loop timing, ensuring d
 
 **Q: Why use unaligned loads (`_mm256_loadu_si256`) for input?**
 A: Input buffers from AudioEngine have no alignment guarantee. Using aligned loads would cause SIGBUS/GPF on unaligned data. On modern CPUs (Haswell+, Zen+), unaligned loads have no penalty when data is naturally aligned, so there's no performance cost.
+
+**Q: Why is DSD SIMD stereo-only?**
+A: The SIMD interleave pattern ([L0 R0 L1 R1...]) is specific to 2-channel layout. Multi-channel DSD (4/6 channels) requires different interleaving that would need per-channel-count SIMD variants. Since multi-channel DSD is rare and stereo covers 99%+ of use cases, we use scalar fallback for multi-channel to maintain correct channel ordering without over-engineering.
