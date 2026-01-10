@@ -636,12 +636,19 @@ Add to `src/DirettaRingBuffer.h` in public section:
             __m128i lo = _mm256_castsi256_si128(shuffled);
             __m128i hi = _mm256_extracti128_si256(shuffled, 1);
 
-            // Store 12 bytes from low lane
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + outputBytes), lo);
+            // Store exactly 12 bytes from low lane (8 + 4 bytes)
+            // Using _mm_storeu_si128 would write 16 bytes, corrupting next data
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + outputBytes), lo);  // 8 bytes
+            uint32_t lo_tail;
+            memcpy(&lo_tail, reinterpret_cast<const char*>(&lo) + 8, 4);
+            memcpy(dst + outputBytes + 8, &lo_tail, 4);  // 4 bytes
             outputBytes += 12;
 
-            // Store 12 bytes from high lane
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + outputBytes), hi);
+            // Store exactly 12 bytes from high lane (8 + 4 bytes)
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + outputBytes), hi);  // 8 bytes
+            uint32_t hi_tail;
+            memcpy(&hi_tail, reinterpret_cast<const char*>(&hi) + 8, 4);
+            memcpy(dst + outputBytes + 8, &hi_tail, 4);  // 4 bytes
             outputBytes += 12;
         }
 
