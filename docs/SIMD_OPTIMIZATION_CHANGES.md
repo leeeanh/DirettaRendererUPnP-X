@@ -105,12 +105,32 @@ writePos_.store((wp + len) & mask_, std::memory_order_release);
 
 #### 3.3 AVX2 Format Conversion Functions
 
+##### S24 Format Auto-Detection
+
+The ring buffer automatically detects whether 24-bit samples are LSB-aligned (S24_LE) or MSB-aligned (S24_32BE-style) by checking the first 32 samples:
+
+```cpp
+enum class S24PackMode { Unknown, LsbAligned, MsbAligned };
+
+S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) const {
+    size_t checkSamples = std::min<size_t>(numSamples, 32);
+    for (size_t i = 0; i < checkSamples; i++) {
+        if (data[i * 4] != 0x00) {
+            return S24PackMode::LsbAligned;  // Data in bytes 0-2
+        }
+    }
+    return S24PackMode::MsbAligned;  // Data in bytes 1-3
+}
+```
+
+The detection result is cached and reset on `configure()` or `clear()` for proper reinitialization.
+
 ##### convert24BitPacked_AVX2()
 
-Converts S24_P32 format (24-bit samples in 32-bit containers) to packed 24-bit:
+Converts LSB-aligned S24_P32 format (24-bit samples in 32-bit containers) to packed 24-bit:
 
 ```
-Input:  [B0 B1 B2 __] [B0 B1 B2 __] ... (4 bytes per sample)
+Input:  [B0 B1 B2 __] [B0 B1 B2 __] ... (4 bytes per sample, LSB-aligned)
 Output: [B0 B1 B2] [B0 B1 B2] ...       (3 bytes per sample)
 ```
 
@@ -126,6 +146,25 @@ size_t convert24BitPacked_AVX2(uint8_t* dst, const uint8_t* src, size_t numSampl
         __m256i shuffled = _mm256_shuffle_epi8(in, shuffle_mask);
         // Extract and store 12 bytes per 128-bit lane...
     }
+}
+```
+
+##### convert24BitPackedShifted_AVX2()
+
+Converts MSB-aligned S24_P32 format (S24_32BE-style) to packed 24-bit:
+
+```
+Input:  [__ B0 B1 B2] [__ B0 B1 B2] ... (4 bytes per sample, MSB-aligned)
+Output: [B0 B1 B2] [B0 B1 B2] ...       (3 bytes per sample)
+```
+
+```cpp
+size_t convert24BitPackedShifted_AVX2(uint8_t* dst, const uint8_t* src, size_t numSamples) {
+    static const __m256i shuffle_mask = _mm256_setr_epi8(
+        1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, -1, -1, -1, -1,  // Skip byte 0, take 1-3
+        1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, -1, -1, -1, -1
+    );
+    // ... same processing as convert24BitPacked_AVX2
 }
 ```
 
@@ -369,6 +408,23 @@ void beginReconfigure();
 void endReconfigure();
 ```
 
+#### 5.1 Quick Resume Underrun Fix
+
+When resuming playback quickly (e.g., pause/play in rapid succession), the stabilization state must be reset to ensure proper prefill:
+
+```cpp
+// In DirettaSync::open() - Clear buffer and reset all state flags
+m_ringBuffer.clear();
+m_prefillComplete = false;
+m_postOnlineDelayDone = false;   // Reset stabilization delay flag
+m_stabilizationCount = 0;        // Reset stabilization counter
+m_stopRequested = false;
+m_draining = false;
+m_silenceBuffersRemaining = 0;
+```
+
+Without resetting `m_postOnlineDelayDone` and `m_stabilizationCount`, the stream could skip the prefill stabilization period after quick resume, causing buffer underruns and audio glitches.
+
 ---
 
 ## New Files
@@ -479,6 +535,41 @@ Alternative memcpy implementations for comparison.
 ### 6. src/test_audio_memory.cpp / src/AudioMemoryTest.h
 
 Benchmark and test harness for memory operations.
+
+#### Testing Improvements
+
+The test harness uses adaptive batched measurements for accurate timing:
+
+```cpp
+// Adaptive inner loop - target ~50μs per measurement
+size_t innerLoops = 1;
+auto calibration_start = std::chrono::steady_clock::now();
+// ... calibration run ...
+double elapsed_us = /* measured time */;
+innerLoops = static_cast<size_t>(std::max(1.0, 50.0 / elapsed_us));
+
+// Warmup phase before timing
+for (size_t w = 0; w < 100; w++) {
+    memcpy_audio(dst, src, size);
+}
+
+// Batched measurements with steady_clock for stability
+for (size_t i = 0; i < iterations; i++) {
+    auto start = std::chrono::steady_clock::now();
+    for (size_t j = 0; j < innerLoops; j++) {
+        memcpy_audio(dst, src, size);
+    }
+    auto end = std::chrono::steady_clock::now();
+    double ns_per_op = duration_ns / innerLoops;
+    // Record timing...
+}
+```
+
+**Key improvements:**
+- Uses `steady_clock` instead of `high_resolution_clock` for monotonic timing
+- Adaptive inner loop batching achieves ~50μs measurement granularity
+- Warmup phase eliminates cold-start effects
+- Ring buffer wraparound test properly drains remaining bytes
 
 ---
 
