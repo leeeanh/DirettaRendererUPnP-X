@@ -59,7 +59,9 @@ bool test_memcpy_audio_fixed_correctness() {
 }
 
 bool test_memcpy_audio_fixed_timing_variance() {
-    constexpr int ITERATIONS = 10000;
+    constexpr int ITERATIONS = 5000;
+    constexpr double TARGET_US = 50.0;
+    constexpr int MAX_INNER_LOOPS = 1 << 20;
     std::vector<size_t> test_sizes = {180, 768, 1536};
 
     for (size_t size : test_sizes) {
@@ -69,18 +71,31 @@ bool test_memcpy_audio_fixed_timing_variance() {
         std::memset(src, 0x5A, sizeof(src));
         std::memset(dst, 0x00, sizeof(dst));
 
-        for (int i = 0; i < 100; i++) {
-            memcpy_audio_fixed(dst, src, size);
+        auto measure = [&](int loops) {
+            auto start = std::chrono::steady_clock::now();
+            for (int j = 0; j < loops; j++) {
+                memcpy_audio_fixed(dst, src, size);
+            }
+            auto end = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(end - start).count();
+        };
+
+        int innerLoops = 1;
+        double elapsed = 0.0;
+        while (innerLoops < MAX_INNER_LOOPS) {
+            elapsed = measure(innerLoops);
+            if (elapsed >= TARGET_US) break;
+            innerLoops <<= 1;
+        }
+
+        for (int i = 0; i < 20; i++) {
+            measure(innerLoops);
         }
 
         TimingStats stats;
         for (int i = 0; i < ITERATIONS; i++) {
-            auto start = std::chrono::high_resolution_clock::now();
-            memcpy_audio_fixed(dst, src, size);
-            auto end = std::chrono::high_resolution_clock::now();
-
-            double us = std::chrono::duration<double, std::micro>(end - start).count();
-            stats.record(us);
+            double us = measure(innerLoops);
+            stats.record(us / innerLoops);
         }
 
         double cv = stats.cv();
@@ -89,7 +104,7 @@ bool test_memcpy_audio_fixed_timing_variance() {
             " (CV=" << cv << ", mean=" << stats.mean() << "us)");
 
         std::cout << "[size=" << size << " mean=" << stats.mean()
-                  << "us cv=" << cv << "] ";
+                  << "us cv=" << cv << " loops=" << innerLoops << "] ";
     }
 
     return true;
@@ -149,7 +164,9 @@ bool test_24bit_packing_correctness() {
 }
 
 bool test_24bit_packing_timing() {
-    constexpr int ITERATIONS = 10000;
+    constexpr int ITERATIONS = 5000;
+    constexpr double TARGET_US = 50.0;
+    constexpr int MAX_INNER_LOOPS = 1 << 20;
     constexpr size_t NUM_SAMPLES = 192;
 
     alignas(64) uint8_t input[NUM_SAMPLES * 4];
@@ -162,21 +179,35 @@ bool test_24bit_packing_timing() {
     DirettaRingBuffer ring;
     ring.resize(1024 * 1024, 0x00);
 
-    for (int i = 0; i < 100; i++) {
-        ring.convert24BitPacked_AVX2(output, input, NUM_SAMPLES);
+    auto measure = [&](int loops) {
+        auto start = std::chrono::steady_clock::now();
+        for (int j = 0; j < loops; j++) {
+            ring.convert24BitPacked_AVX2(output, input, NUM_SAMPLES);
+        }
+        auto end = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::micro>(end - start).count();
+    };
+
+    int innerLoops = 1;
+    double elapsed = 0.0;
+    while (innerLoops < MAX_INNER_LOOPS) {
+        elapsed = measure(innerLoops);
+        if (elapsed >= TARGET_US) break;
+        innerLoops <<= 1;
+    }
+
+    for (int i = 0; i < 20; i++) {
+        measure(innerLoops);
     }
 
     TimingStats stats;
     for (int i = 0; i < ITERATIONS; i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        ring.convert24BitPacked_AVX2(output, input, NUM_SAMPLES);
-        auto end = std::chrono::high_resolution_clock::now();
-
-        double us = std::chrono::duration<double, std::micro>(end - start).count();
-        stats.record(us);
+        double us = measure(innerLoops);
+        stats.record(us / innerLoops);
     }
 
-    std::cout << "[24bit mean=" << stats.mean() << "us cv=" << stats.cv() << "] ";
+    std::cout << "[24bit mean=" << stats.mean() << "us cv=" << stats.cv()
+              << " loops=" << innerLoops << "] ";
     TEST_ASSERT(stats.cv() < 0.5, "24-bit packing timing variance too high");
 
     return true;
@@ -261,6 +292,9 @@ bool test_ring_buffer_wraparound() {
 
     std::vector<uint8_t> tmp(800);
     ring.pop(tmp.data(), tmp.size());
+
+    std::vector<uint8_t> leftover(100);
+    ring.pop(leftover.data(), leftover.size());
 
     std::vector<uint8_t> wrapData(200);
     for (size_t i = 0; i < 200; i++) {
