@@ -104,6 +104,7 @@ public:
         silenceByte_.store(silenceByte, std::memory_order_release);
         clear();
         fillWithSilence();
+        m_s24PackMode = S24PackMode::Unknown;
     }
 
     size_t size() const { return size_; }
@@ -130,6 +131,7 @@ public:
     void clear() {
         writePos_.store(0, std::memory_order_release);
         readPos_.store(0, std::memory_order_release);
+        m_s24PackMode = S24PackMode::Unknown;
     }
 
     void fillWithSilence() {
@@ -184,7 +186,13 @@ public:
 
         prefetch_audio_buffer(data, numSamples * 4);
 
-        size_t stagedBytes = convert24BitPacked_AVX2(m_staging24BitPack, data, numSamples);
+        if (m_s24PackMode == S24PackMode::Unknown) {
+            m_s24PackMode = detectS24PackMode(data, numSamples);
+        }
+
+        size_t stagedBytes = (m_s24PackMode == S24PackMode::MsbAligned)
+            ? convert24BitPackedShifted_AVX2(m_staging24BitPack, data, numSamples)
+            : convert24BitPacked_AVX2(m_staging24BitPack, data, numSamples);
         size_t written = writeToRing(m_staging24BitPack, stagedBytes);
         size_t samplesWritten = written / 3;
 
@@ -297,6 +305,50 @@ public:
             dst[outputBytes + 0] = src[i * 4 + 0];
             dst[outputBytes + 1] = src[i * 4 + 1];
             dst[outputBytes + 2] = src[i * 4 + 2];
+            outputBytes += 3;
+        }
+
+        _mm256_zeroupper();
+        return outputBytes;
+    }
+
+    size_t convert24BitPackedShifted_AVX2(uint8_t* dst, const uint8_t* src, size_t numSamples) {
+        size_t outputBytes = 0;
+
+        static const __m256i shuffle_mask = _mm256_setr_epi8(
+            1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, -1, -1, -1, -1,
+            1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, -1, -1, -1, -1
+        );
+
+        size_t i = 0;
+        for (; i + 8 <= numSamples; i += 8) {
+            if (i + 16 <= numSamples) {
+                _mm_prefetch(reinterpret_cast<const char*>(src + (i + 16) * 4), _MM_HINT_T0);
+            }
+
+            __m256i in = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 4));
+            __m256i shuffled = _mm256_shuffle_epi8(in, shuffle_mask);
+
+            __m128i lo = _mm256_castsi256_si128(shuffled);
+            __m128i hi = _mm256_extracti128_si256(shuffled, 1);
+
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + outputBytes), lo);
+            uint32_t lo_tail;
+            std::memcpy(&lo_tail, reinterpret_cast<const char*>(&lo) + 8, 4);
+            std::memcpy(dst + outputBytes + 8, &lo_tail, 4);
+            outputBytes += 12;
+
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + outputBytes), hi);
+            uint32_t hi_tail;
+            std::memcpy(&hi_tail, reinterpret_cast<const char*>(&hi) + 8, 4);
+            std::memcpy(dst + outputBytes + 8, &hi_tail, 4);
+            outputBytes += 12;
+        }
+
+        for (; i < numSamples; i++) {
+            dst[outputBytes + 0] = src[i * 4 + 1];
+            dst[outputBytes + 1] = src[i * 4 + 2];
+            dst[outputBytes + 2] = src[i * 4 + 3];
             outputBytes += 3;
         }
 
@@ -569,6 +621,18 @@ private:
     alignas(64) std::atomic<size_t> writePos_{0};
     alignas(64) std::atomic<size_t> readPos_{0};
     std::atomic<uint8_t> silenceByte_{0};
+
+    enum class S24PackMode { Unknown, LsbAligned, MsbAligned };
+    S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) const {
+        size_t checkSamples = std::min<size_t>(numSamples, 32);
+        for (size_t i = 0; i < checkSamples; i++) {
+            if (data[i * 4] != 0x00) {
+                return S24PackMode::LsbAligned;
+            }
+        }
+        return S24PackMode::MsbAligned;
+    }
+    S24PackMode m_s24PackMode = S24PackMode::Unknown;
 };
 
 #endif // DIRETTA_RING_BUFFER_H
