@@ -8,6 +8,7 @@
 #include <thread>
 #include <cstring>
 #include <algorithm>
+#include "memcpyfast_audio.h"
 
 extern "C" {
 
@@ -629,8 +630,8 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                 if (m_remainingSamples.size() < excess * 2) {
                     m_remainingSamples.resize(excess * 2);
                 }
-                memcpy(m_remainingSamples.data(), pktL + toTake, excess);
-                memcpy(m_remainingSamples.data() + excess, pktR + toTake, excess);
+                memcpy_audio(m_remainingSamples.data(), pktL + toTake, excess);
+                memcpy_audio(m_remainingSamples.data() + excess, pktR + toTake, excess);
                 m_remainingCount = excess * 2;
             }
 
@@ -642,8 +643,8 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
         size_t totalBytes = actualPerCh * 2;
 
         if (actualPerCh > 0) {
-            memcpy(buffer.data(), leftData.data(), actualPerCh);
-            memcpy(buffer.data() + actualPerCh, rightData.data(), actualPerCh);
+            memcpy_audio(buffer.data(), leftData.data(), actualPerCh);
+            memcpy_audio(buffer.data() + actualPerCh, rightData.data(), actualPerCh);
         }
 
         // Debug output
@@ -721,7 +722,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
     // CRITICAL FIX: D'abord, utiliser les samples restants du buffer interne
     if (m_remainingCount > 0) {
         size_t samplesToUse = std::min(m_remainingCount, numSamples);
-        memcpy(outputPtr, m_remainingSamples.data(), samplesToUse * bytesPerSample);
+        memcpy_audio(outputPtr, m_remainingSamples.data(), samplesToUse * bytesPerSample);
         outputPtr += samplesToUse * bytesPerSample;
         totalSamplesRead += samplesToUse;
 
@@ -829,7 +830,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
 
                 // Copy DSD data
                 if (frame->format == AV_SAMPLE_FMT_U8) {
-                    memcpy(outputPtr, frame->data[0], bytesToCopy);
+                    memcpy_audio(outputPtr, frame->data[0], bytesToCopy);
                 } else if (frame->format == AV_SAMPLE_FMT_U8P) {
                     // Planar to interleaved
                     for (size_t i = 0; i < frameSamples; i++) {
@@ -876,7 +877,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                         size_t bytesToUse = samplesToUse * bytesPerSample;
 
                         // Copier vers le buffer de sortie
-                        memcpy(outputPtr, tempBuffer.data(), bytesToUse);
+                        memcpy_audio(outputPtr, tempBuffer.data(), bytesToUse);
                         outputPtr += bytesToUse;
                         totalSamplesRead += samplesToUse;
 
@@ -891,7 +892,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                             }
 
                             // Copier l'excédent
-                            memcpy(m_remainingSamples.data(),
+                            memcpy_audio(m_remainingSamples.data(),
                                    tempBuffer.data() + bytesToUse,
                                    excessBytes);
                             m_remainingCount = excess;
@@ -908,7 +909,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                     size_t samplesToCopy = std::min(frameSamples, samplesNeeded);
                     size_t bytesToCopy = samplesToCopy * bytesPerSample;
 
-                    memcpy(outputPtr, frame->data[0], bytesToCopy);
+                    memcpy_audio(outputPtr, frame->data[0], bytesToCopy);
                     outputPtr += bytesToCopy;
                     totalSamplesRead += samplesToCopy;
 
@@ -921,7 +922,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                             m_remainingSamples.resize(excessBytes);
                         }
 
-                        memcpy(m_remainingSamples.data(),
+                        memcpy_audio(m_remainingSamples.data(),
                                frame->data[0] + bytesToCopy,
                                excessBytes);
                         m_remainingCount = excess;

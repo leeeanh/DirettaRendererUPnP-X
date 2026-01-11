@@ -11,9 +11,75 @@
 
 #include <vector>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <cstdlib>
+#include <new>
+#include <type_traits>
+#include <immintrin.h>
+#include "memcpyfast_audio.h"
+
+template <typename T, size_t Alignment>
+class AlignedAllocator {
+public:
+    using value_type = T;
+    using pointer = T*;
+    using const_pointer = const T*;
+    using void_pointer = void*;
+    using const_void_pointer = const void*;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+    using propagate_on_container_move_assignment = std::true_type;
+    using is_always_equal = std::true_type;
+
+    template <typename U>
+    struct rebind {
+        using other = AlignedAllocator<U, Alignment>;
+    };
+
+    AlignedAllocator() noexcept = default;
+    template <typename U>
+    AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+
+    pointer allocate(std::size_t n) {
+        if (n == 0) {
+            return nullptr;
+        }
+        void* ptr = nullptr;
+        std::size_t bytes = n * sizeof(T);
+#if defined(_MSC_VER)
+        ptr = _aligned_malloc(bytes, Alignment);
+        if (!ptr) {
+            throw std::bad_alloc();
+        }
+#else
+        if (posix_memalign(&ptr, Alignment, bytes) != 0) {
+            throw std::bad_alloc();
+        }
+#endif
+        return static_cast<T*>(ptr);
+    }
+
+    void deallocate(T* p, std::size_t) noexcept {
+#if defined(_MSC_VER)
+        _aligned_free(p);
+#else
+        free(p);
+#endif
+    }
+};
+
+template <typename T, size_t Alignment>
+bool operator==(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<T, Alignment>&) {
+    return true;
+}
+
+template <typename T, size_t Alignment>
+bool operator!=(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<T, Alignment>&) {
+    return false;
+}
 
 /**
  * @brief Lock-free ring buffer for audio data
@@ -32,24 +98,33 @@ public:
      * @brief Resize buffer and set silence byte
      */
     void resize(size_t newSize, uint8_t silenceByte) {
-        buffer_.resize(newSize);
-        size_ = newSize;
-        silenceByte_ = silenceByte;
+        size_ = roundUpPow2(newSize);
+        mask_ = size_ - 1;
+        buffer_.resize(size_);
+        silenceByte_.store(silenceByte, std::memory_order_release);
         clear();
         fillWithSilence();
     }
 
     size_t size() const { return size_; }
-    uint8_t silenceByte() const { return silenceByte_; }
+    uint8_t silenceByte() const { return silenceByte_.load(std::memory_order_acquire); }
 
     size_t getAvailable() const {
+        if (size_ == 0) {
+            return 0;
+        }
         size_t wp = writePos_.load(std::memory_order_acquire);
         size_t rp = readPos_.load(std::memory_order_acquire);
-        return (wp >= rp) ? (wp - rp) : (size_ - rp + wp);
+        return (wp - rp) & mask_;
     }
 
     size_t getFreeSpace() const {
-        return size_ - getAvailable() - 1;
+        if (size_ == 0) {
+            return 0;
+        }
+        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t rp = readPos_.load(std::memory_order_acquire);
+        return (rp - wp - 1) & mask_;
     }
 
     void clear() {
@@ -58,8 +133,12 @@ public:
     }
 
     void fillWithSilence() {
-        std::memset(buffer_.data(), silenceByte_, size_);
+        std::memset(buffer_.data(), silenceByte_.load(std::memory_order_relaxed), size_);
     }
+
+    const uint8_t* getStaging24BitPack() const { return m_staging24BitPack; }
+    const uint8_t* getStaging16To32() const { return m_staging16To32; }
+    const uint8_t* getStagingDSD() const { return m_stagingDSD; }
 
     //=========================================================================
     // Push methods (write to buffer)
@@ -69,6 +148,7 @@ public:
      * @brief Push PCM data directly (no conversion)
      */
     size_t push(const uint8_t* data, size_t len) {
+        if (size_ == 0) return 0;
         size_t free = getFreeSpace();
         if (len > free) len = free;
         if (len == 0) return 0;
@@ -76,12 +156,12 @@ public:
         size_t wp = writePos_.load(std::memory_order_acquire);
         size_t firstChunk = std::min(len, size_ - wp);
 
-        std::memcpy(buffer_.data() + wp, data, firstChunk);
+        memcpy_audio(buffer_.data() + wp, data, firstChunk);
         if (firstChunk < len) {
-            std::memcpy(buffer_.data(), data + firstChunk, len - firstChunk);
+            memcpy_audio(buffer_.data(), data + firstChunk, len - firstChunk);
         }
 
-        writePos_.store((wp + len) % size_, std::memory_order_release);
+        writePos_.store((wp + len) & mask_, std::memory_order_release);
         return len;
     }
 
@@ -90,29 +170,25 @@ public:
      * @return Input bytes consumed
      */
     size_t push24BitPacked(const uint8_t* data, size_t inputSize) {
+        if (size_ == 0) return 0;
         size_t numSamples = inputSize / 4;
-        size_t outSize = numSamples * 3;
-        size_t free = getFreeSpace();
-
-        if (outSize > free) {
-            numSamples = free / 3;
-            outSize = numSamples * 3;
-        }
         if (numSamples == 0) return 0;
 
-        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t maxSamples = STAGING_SIZE / 3;
+        size_t free = getFreeSpace();
+        size_t maxSamplesByFree = free / 3;
 
-        for (size_t i = 0; i < numSamples; i++) {
-            const uint8_t* src = data + i * 4;
-            size_t dstPos = (wp + i * 3) % size_;
+        if (numSamples > maxSamples) numSamples = maxSamples;
+        if (numSamples > maxSamplesByFree) numSamples = maxSamplesByFree;
+        if (numSamples == 0) return 0;
 
-            buffer_[dstPos] = src[0];
-            buffer_[(dstPos + 1) % size_] = src[1];
-            buffer_[(dstPos + 2) % size_] = src[2];
-        }
+        prefetch_audio_buffer(data, numSamples * 4);
 
-        writePos_.store((wp + outSize) % size_, std::memory_order_release);
-        return numSamples * 4;  // Return input bytes consumed
+        size_t stagedBytes = convert24BitPacked_AVX2(m_staging24BitPack, data, numSamples);
+        size_t written = writeToRing(m_staging24BitPack, stagedBytes);
+        size_t samplesWritten = written / 3;
+
+        return samplesWritten * 4;
     }
 
     /**
@@ -120,31 +196,25 @@ public:
      * @return Input bytes consumed
      */
     size_t push16To32(const uint8_t* data, size_t inputSize) {
+        if (size_ == 0) return 0;
         size_t numSamples = inputSize / 2;
-        size_t outSize = numSamples * 4;
-        size_t free = getFreeSpace();
-
-        if (outSize > free) {
-            numSamples = free / 4;
-            outSize = numSamples * 4;
-        }
         if (numSamples == 0) return 0;
 
-        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t maxSamples = STAGING_SIZE / 4;
+        size_t free = getFreeSpace();
+        size_t maxSamplesByFree = free / 4;
 
-        for (size_t i = 0; i < numSamples; i++) {
-            const uint8_t* src = data + i * 2;
-            size_t dstPos = (wp + i * 4) % size_;
+        if (numSamples > maxSamples) numSamples = maxSamples;
+        if (numSamples > maxSamplesByFree) numSamples = maxSamplesByFree;
+        if (numSamples == 0) return 0;
 
-            // Convert 16-bit to 32-bit: shift left by 16 bits (little-endian)
-            buffer_[dstPos] = 0;
-            buffer_[(dstPos + 1) % size_] = 0;
-            buffer_[(dstPos + 2) % size_] = src[0];
-            buffer_[(dstPos + 3) % size_] = src[1];
-        }
+        prefetch_audio_buffer(data, numSamples * 2);
 
-        writePos_.store((wp + outSize) % size_, std::memory_order_release);
-        return inputSize;
+        size_t stagedBytes = convert16To32_AVX2(m_staging16To32, data, numSamples);
+        size_t written = writeToRing(m_staging16To32, stagedBytes);
+        size_t samplesWritten = written / 4;
+
+        return samplesWritten * 2;
     }
 
     /**
@@ -162,56 +232,189 @@ public:
      */
     size_t pushDSDPlanar(const uint8_t* data, size_t inputSize, int numChannels,
                          const uint8_t* bitReverseTable, bool byteSwap = false) {
-        size_t bytesPerChannel = inputSize / numChannels;
-        size_t completeGroups = bytesPerChannel / 4;
-        size_t usableOutput = completeGroups * 4 * numChannels;
+        if (size_ == 0) return 0;
+        if (numChannels == 0) return 0;
+
+        size_t maxBytes = inputSize;
+        if (maxBytes > STAGING_SIZE) maxBytes = STAGING_SIZE;
         size_t free = getFreeSpace();
+        if (maxBytes > free) maxBytes = free;
 
-        if (usableOutput > free) {
-            completeGroups = free / (4 * numChannels);
-            usableOutput = completeGroups * 4 * numChannels;
+        size_t bytesPerChannel = maxBytes / static_cast<size_t>(numChannels);
+        size_t completeGroups = bytesPerChannel / 4;
+        size_t usableInput = completeGroups * 4 * static_cast<size_t>(numChannels);
+        if (usableInput == 0) return 0;
+
+        prefetch_audio_buffer(data, usableInput);
+
+        size_t stagedBytes = convertDSDPlanar_AVX2(
+            m_stagingDSD, data, usableInput, numChannels, bitReverseTable, byteSwap);
+        size_t written = writeToRing(m_stagingDSD, stagedBytes);
+
+        return written;
+    }
+
+    /**
+     * Convert S24_P32 to packed 24-bit using AVX2
+     * Input: 4 bytes per sample (24-bit in 32-bit container)
+     * Output: 3 bytes per sample (packed)
+     * Returns: number of output bytes written
+     */
+    size_t convert24BitPacked_AVX2(uint8_t* dst, const uint8_t* src, size_t numSamples) {
+        size_t outputBytes = 0;
+
+        static const __m256i shuffle_mask = _mm256_setr_epi8(
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1,
+            0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1
+        );
+
+        size_t i = 0;
+        for (; i + 8 <= numSamples; i += 8) {
+            if (i + 16 <= numSamples) {
+                _mm_prefetch(reinterpret_cast<const char*>(src + (i + 16) * 4), _MM_HINT_T0);
+            }
+
+            __m256i in = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 4));
+            __m256i shuffled = _mm256_shuffle_epi8(in, shuffle_mask);
+
+            __m128i lo = _mm256_castsi256_si128(shuffled);
+            __m128i hi = _mm256_extracti128_si256(shuffled, 1);
+
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + outputBytes), lo);
+            uint32_t lo_tail;
+            std::memcpy(&lo_tail, reinterpret_cast<const char*>(&lo) + 8, 4);
+            std::memcpy(dst + outputBytes + 8, &lo_tail, 4);
+            outputBytes += 12;
+
+            _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + outputBytes), hi);
+            uint32_t hi_tail;
+            std::memcpy(&hi_tail, reinterpret_cast<const char*>(&hi) + 8, 4);
+            std::memcpy(dst + outputBytes + 8, &hi_tail, 4);
+            outputBytes += 12;
         }
-        if (completeGroups == 0) return 0;
 
-        size_t wp = writePos_.load(std::memory_order_acquire);
+        for (; i < numSamples; i++) {
+            dst[outputBytes + 0] = src[i * 4 + 0];
+            dst[outputBytes + 1] = src[i * 4 + 1];
+            dst[outputBytes + 2] = src[i * 4 + 2];
+            outputBytes += 3;
+        }
 
-        // Pack planar data into 4-byte groups per channel
-        for (size_t g = 0; g < completeGroups; g++) {
-            for (int c = 0; c < numChannels; c++) {
-                const uint8_t* channelData = data + c * bytesPerChannel;
-                size_t srcOffset = g * 4;
-                size_t dstPos = (wp + g * 4 * numChannels + c * 4) % size_;
+        _mm256_zeroupper();
+        return outputBytes;
+    }
 
-                uint8_t b0 = channelData[srcOffset];
-                uint8_t b1 = channelData[srcOffset + 1];
-                uint8_t b2 = channelData[srcOffset + 2];
-                uint8_t b3 = channelData[srcOffset + 3];
+    /**
+     * Convert 16-bit to 32-bit using AVX2
+     * Input: 2 bytes per sample (16-bit)
+     * Output: 4 bytes per sample (16-bit value in upper 16 bits)
+     * Returns: number of output bytes written
+     */
+    size_t convert16To32_AVX2(uint8_t* dst, const uint8_t* src, size_t numSamples) {
+        size_t outputBytes = 0;
 
-                // Apply bit reversal if needed (MSB<->LSB conversion)
-                if (bitReverseTable) {
-                    b0 = bitReverseTable[b0];
-                    b1 = bitReverseTable[b1];
-                    b2 = bitReverseTable[b2];
-                    b3 = bitReverseTable[b3];
+        size_t i = 0;
+        for (; i + 16 <= numSamples; i += 16) {
+            __m256i in = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 2));
+            __m256i zero = _mm256_setzero_si256();
+
+            __m256i lo = _mm256_unpacklo_epi16(zero, in);
+            __m256i hi = _mm256_unpackhi_epi16(zero, in);
+
+            __m256i out0 = _mm256_permute2x128_si256(lo, hi, 0x20);
+            __m256i out1 = _mm256_permute2x128_si256(lo, hi, 0x31);
+
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out0);
+            outputBytes += 32;
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out1);
+            outputBytes += 32;
+        }
+
+        for (; i < numSamples; i++) {
+            dst[outputBytes + 0] = 0x00;
+            dst[outputBytes + 1] = 0x00;
+            dst[outputBytes + 2] = src[i * 2 + 0];
+            dst[outputBytes + 3] = src[i * 2 + 1];
+            outputBytes += 4;
+        }
+
+        _mm256_zeroupper();
+        return outputBytes;
+    }
+
+    /**
+     * Convert DSD planar to interleaved using AVX2 (stereo only)
+     * Input: [L channel bytes][R channel bytes] planar
+     * Output: [4B L][4B R][4B L][4B R]... interleaved
+     * Falls back to scalar for non-stereo
+     */
+    size_t convertDSDPlanar_AVX2(
+        uint8_t* dst,
+        const uint8_t* src,
+        size_t totalInputBytes,
+        int numChannels,
+        const uint8_t* bitReversalTable,
+        bool needByteSwap
+    ) {
+        size_t bytesPerChannel = totalInputBytes / static_cast<size_t>(numChannels);
+        size_t outputBytes = 0;
+
+        if (numChannels == 2) {
+            const uint8_t* srcL = src;
+            const uint8_t* srcR = src + bytesPerChannel;
+
+            static const __m256i byteswap_mask = _mm256_setr_epi8(
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12
+            );
+
+            size_t i = 0;
+            for (; i + 32 <= bytesPerChannel; i += 32) {
+                __m256i left = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcL + i));
+                __m256i right = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcR + i));
+
+                if (bitReversalTable) {
+                    left = simd_bit_reverse(left);
+                    right = simd_bit_reverse(right);
                 }
 
-                // Write bytes - swap order for LITTLE endian targets
-                if (byteSwap) {
-                    buffer_[dstPos] = b3;
-                    buffer_[(dstPos + 1) % size_] = b2;
-                    buffer_[(dstPos + 2) % size_] = b1;
-                    buffer_[(dstPos + 3) % size_] = b0;
-                } else {
-                    buffer_[dstPos] = b0;
-                    buffer_[(dstPos + 1) % size_] = b1;
-                    buffer_[(dstPos + 2) % size_] = b2;
-                    buffer_[(dstPos + 3) % size_] = b3;
+                __m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
+                __m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
+
+                if (needByteSwap) {
+                    interleaved_lo = _mm256_shuffle_epi8(interleaved_lo, byteswap_mask);
+                    interleaved_hi = _mm256_shuffle_epi8(interleaved_hi, byteswap_mask);
+                }
+
+                __m256i out0 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x20);
+                __m256i out1 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x31);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out0);
+                outputBytes += 32;
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out1);
+                outputBytes += 32;
+            }
+
+            for (; i + 4 <= bytesPerChannel; i += 4) {
+                for (int j = 0; j < 4; j++) {
+                    uint8_t b = srcL[i + j];
+                    if (bitReversalTable) b = bitReversalTable[b];
+                    dst[outputBytes++] = b;
+                }
+                for (int j = 0; j < 4; j++) {
+                    uint8_t b = srcR[i + j];
+                    if (bitReversalTable) b = bitReversalTable[b];
+                    dst[outputBytes++] = b;
                 }
             }
+
+            _mm256_zeroupper();
+        } else {
+            outputBytes = convertDSDPlanar_Scalar(dst, src, totalInputBytes, numChannels,
+                                                  bitReversalTable, needByteSwap);
         }
 
-        writePos_.store((wp + usableOutput) % size_, std::memory_order_release);
-        return completeGroups * 4 * numChannels;  // Return input bytes consumed
+        return outputBytes;
     }
 
     //=========================================================================
@@ -222,6 +425,7 @@ public:
      * @brief Pop data from buffer
      */
     size_t pop(uint8_t* dest, size_t len) {
+        if (size_ == 0) return 0;
         size_t avail = getAvailable();
         if (len > avail) len = avail;
         if (len == 0) return 0;
@@ -229,12 +433,12 @@ public:
         size_t rp = readPos_.load(std::memory_order_acquire);
         size_t firstChunk = std::min(len, size_ - rp);
 
-        std::memcpy(dest, buffer_.data() + rp, firstChunk);
+        memcpy_audio(dest, buffer_.data() + rp, firstChunk);
         if (firstChunk < len) {
-            std::memcpy(dest + firstChunk, buffer_.data(), len - firstChunk);
+            memcpy_audio(dest + firstChunk, buffer_.data(), len - firstChunk);
         }
 
-        readPos_.store((rp + len) % size_, std::memory_order_release);
+        readPos_.store((rp + len) & mask_, std::memory_order_release);
         return len;
     }
 
@@ -242,11 +446,129 @@ public:
     const uint8_t* data() const { return buffer_.data(); }
 
 private:
-    std::vector<uint8_t> buffer_;
+    /**
+     * Write staged data to ring buffer with efficient wraparound handling
+     * Uses memcpy_audio_fixed for consistent timing
+     */
+    size_t writeToRing(const uint8_t* staged, size_t len) {
+        size_t size = buffer_.size();
+        if (size == 0 || len == 0) return 0;
+
+        size_t writePos = writePos_.load(std::memory_order_relaxed);
+        size_t readPos = readPos_.load(std::memory_order_acquire);
+
+        size_t available = (readPos > writePos)
+            ? (readPos - writePos - 1)
+            : (size - writePos + readPos - 1);
+
+        if (len > available) {
+            len = available;
+        }
+        if (len == 0) return 0;
+
+        uint8_t* ring = buffer_.data();
+        size_t firstChunk = std::min(len, size - writePos);
+
+        if (firstChunk >= 32) {
+            memcpy_audio_fixed(ring + writePos, staged, firstChunk);
+        } else if (firstChunk > 0) {
+            std::memcpy(ring + writePos, staged, firstChunk);
+        }
+
+        size_t secondChunk = len - firstChunk;
+        if (secondChunk > 0) {
+            if (secondChunk >= 32) {
+                memcpy_audio_fixed(ring, staged + firstChunk, secondChunk);
+            } else {
+                std::memcpy(ring, staged + firstChunk, secondChunk);
+            }
+        }
+
+        size_t newWritePos = (writePos + len) % size;
+        writePos_.store(newWritePos, std::memory_order_release);
+
+        return len;
+    }
+
+    size_t convertDSDPlanar_Scalar(
+        uint8_t* dst,
+        const uint8_t* src,
+        size_t totalInputBytes,
+        int numChannels,
+        const uint8_t* bitReversalTable,
+        bool needByteSwap
+    ) {
+        size_t bytesPerChannel = totalInputBytes / static_cast<size_t>(numChannels);
+        size_t outputBytes = 0;
+
+        for (size_t i = 0; i < bytesPerChannel; i += 4) {
+            for (int ch = 0; ch < numChannels; ch++) {
+                uint8_t group[4] = {0, 0, 0, 0};
+                for (int j = 0; j < 4 && (i + static_cast<size_t>(j)) < bytesPerChannel; j++) {
+                    uint8_t b = src[static_cast<size_t>(ch) * bytesPerChannel + i + static_cast<size_t>(j)];
+                    if (bitReversalTable) b = bitReversalTable[b];
+                    group[j] = b;
+                }
+
+                if (needByteSwap) {
+                    dst[outputBytes++] = group[3];
+                    dst[outputBytes++] = group[2];
+                    dst[outputBytes++] = group[1];
+                    dst[outputBytes++] = group[0];
+                } else {
+                    dst[outputBytes++] = group[0];
+                    dst[outputBytes++] = group[1];
+                    dst[outputBytes++] = group[2];
+                    dst[outputBytes++] = group[3];
+                }
+            }
+        }
+
+        return outputBytes;
+    }
+
+    static __m256i simd_bit_reverse(__m256i x) {
+        static const __m256i nibble_reverse = _mm256_setr_epi8(
+            0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+            0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF,
+            0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+            0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF
+        );
+
+        __m256i mask_0f = _mm256_set1_epi8(0x0F);
+        __m256i lo_nibbles = _mm256_and_si256(x, mask_0f);
+        __m256i hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(x, 4), mask_0f);
+
+        __m256i lo_reversed = _mm256_shuffle_epi8(nibble_reverse, lo_nibbles);
+        __m256i hi_reversed = _mm256_shuffle_epi8(nibble_reverse, hi_nibbles);
+
+        return _mm256_or_si256(_mm256_slli_epi16(lo_reversed, 4), hi_reversed);
+    }
+
+    static size_t roundUpPow2(size_t value) {
+        if (value < 2) {
+            return 2;
+        }
+        size_t result = 1;
+        while (result < value) {
+            result <<= 1;
+        }
+        return result;
+    }
+
+    static constexpr size_t STAGING_SIZE = 65536;
+    alignas(64) uint8_t m_staging24BitPack[STAGING_SIZE];
+    alignas(64) uint8_t m_staging16To32[STAGING_SIZE];
+    alignas(64) uint8_t m_stagingDSD[STAGING_SIZE];
+
+    static constexpr size_t kRingAlignment = 64;
+
+    std::vector<uint8_t, AlignedAllocator<uint8_t, kRingAlignment>> buffer_;
     size_t size_ = 0;
-    std::atomic<size_t> writePos_{0};
-    std::atomic<size_t> readPos_{0};
-    uint8_t silenceByte_ = 0;
+    size_t mask_ = 0;
+    alignas(64) std::atomic<size_t> writePos_{0};
+    alignas(64) std::atomic<size_t> readPos_{0};
+    std::atomic<uint8_t> silenceByte_{0};
 };
 
 #endif // DIRETTA_RING_BUFFER_H

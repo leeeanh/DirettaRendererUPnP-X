@@ -11,7 +11,9 @@
 # ============================================
 
 CXX = g++
+CC = gcc
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -pthread
+CFLAGS = -O3 -Wall
 LDFLAGS = -pthread
 
 # ============================================
@@ -69,6 +71,24 @@ ifdef ARCH_NAME
     FULL_VARIANT = $(ARCH_NAME)
 else
     FULL_VARIANT = $(DEFAULT_VARIANT)
+endif
+
+# ============================================
+# Architecture-specific compiler flags
+# ============================================
+
+DIRETTA_ARCH = $(word 1,$(subst -, ,$(FULL_VARIANT)))
+
+ifeq ($(DIRETTA_ARCH),x64)
+    CXXFLAGS += -mavx2 -mfma
+    CFLAGS += -mavx2 -mfma
+    ifneq (,$(findstring v4,$(FULL_VARIANT)))
+        CXXFLAGS += -mavx512f -mavx512bw
+        CFLAGS += -mavx512f -mavx512bw
+    else ifneq (,$(findstring zen4,$(FULL_VARIANT)))
+        CXXFLAGS += -mavx512f -mavx512bw
+        CFLAGS += -mavx512f -mavx512bw
+    endif
 endif
 
 ifdef NOLOG
@@ -167,8 +187,14 @@ SOURCES = \
     $(SRCDIR)/DirettaSync.cpp \
     $(SRCDIR)/UPnPDevice.cpp
 
+# C sources (AVX optimized memcpy)
+C_SOURCES = \
+    $(SRCDIR)/fastmemcpy-avx.c
+
 OBJECTS = $(SOURCES:$(SRCDIR)/%.cpp=$(OBJDIR)/%.o)
-DEPENDS = $(OBJECTS:.o=.d)
+C_OBJECTS = $(C_SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+C_DEPENDS = $(C_OBJECTS:.o=.d)
+DEPENDS = $(OBJECTS:.o=.d) $(C_DEPENDS)
 
 TARGET = $(BINDIR)/DirettaRendererUPnP
 
@@ -183,13 +209,18 @@ all: $(TARGET)
 	@echo "Build complete: $(TARGET)"
 	@echo "Architecture: Simplified (DirettaSync unified)"
 
-$(TARGET): $(OBJECTS) | $(BINDIR)
+$(TARGET): $(OBJECTS) $(C_OBJECTS) | $(BINDIR)
 	@echo "Linking $(TARGET)..."
-	$(CXX) $(OBJECTS) $(LDFLAGS) $(LIBS) -o $(TARGET)
+	$(CXX) $(OBJECTS) $(C_OBJECTS) $(LDFLAGS) $(LIBS) -o $(TARGET)
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp | $(OBJDIR)
 	@echo "Compiling $<..."
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+# C compilation rule (AVX/AVX-512 optimized)
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
+	@echo "Compiling $< (C/AVX)..."
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(OBJDIR):
 	@mkdir -p $(OBJDIR)
@@ -209,5 +240,21 @@ info:
 	@echo "  DirettaRingBuffer.h  - Extracted ring buffer class"
 	@echo "  DirettaSync.h/cpp    - Unified adapter (replaces DirettaSyncAdapter + DirettaOutput)"
 	@echo "  DirettaRenderer.h/cpp - Simplified renderer"
+
+# ============================================
+# Test Target
+# ============================================
+
+TEST_TARGET = $(BINDIR)/test_audio_memory
+TEST_SOURCES = $(SRCDIR)/test_audio_memory.cpp
+TEST_OBJECTS = $(TEST_SOURCES:$(SRCDIR)/%.cpp=$(OBJDIR)/%.o)
+
+test: $(TEST_TARGET)
+	@echo "Running tests..."
+	@./$(TEST_TARGET)
+
+$(TEST_TARGET): $(TEST_OBJECTS) | $(BINDIR)
+	@echo "Linking $(TEST_TARGET)..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(TEST_OBJECTS) -o $(TEST_TARGET)
 
 -include $(DEPENDS)
