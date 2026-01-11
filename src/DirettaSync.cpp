@@ -350,6 +350,8 @@ bool DirettaSync::open(const AudioFormat& format) {
             // Clear buffer and reset flags
             m_ringBuffer.clear();
             m_prefillComplete = false;
+            m_postOnlineDelayDone = false;
+            m_stabilizationCount = 0;
             m_stopRequested = false;
             m_draining = false;
             m_silenceBuffersRemaining = 0;
