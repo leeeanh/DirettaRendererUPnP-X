@@ -125,13 +125,18 @@ private:
 
     // DSD Native Mode
     bool m_rawDSD;           // True if reading raw DSD packets (no decoding)
-    AVPacket* m_packet;      // For raw packet reading
+    AVPacket* m_packet;      // Reusable for raw packet reading (DSD and PCM)
+    AVFrame* m_frame;        // Reusable for decoded frames (PCM)
 
     // CRITICAL: Buffer interne pour les samples excédentaires
     // Quand une frame décodée contient plus de samples que demandé,
     // on garde l'excédent ici pour le prochain appel
     AudioBuffer m_remainingSamples;
     size_t m_remainingCount;
+
+    // Reusable resample buffer (eliminates per-call allocation)
+    AudioBuffer m_resampleBuffer;
+    size_t m_resampleBufferCapacity = 0;
 
     // Debug/diagnostic counters (instance variables, NOT static!)
     // These were previously static variables causing race conditions when
