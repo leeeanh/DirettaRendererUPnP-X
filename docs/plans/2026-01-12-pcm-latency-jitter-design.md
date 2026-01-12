@@ -18,8 +18,9 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Compile-time Constants (src/DirettaSync.h)                 │
-│  PCM_BUFFER_SECONDS = 0.3f  (was 1.0f)                      │
-│  PCM_PREFILL_MS = 30        (was 50)                        │
+│  PCM_BUFFER_SECONDS = 0.3f    (was 1.0f)                    │
+│  PCM_PREFILL_MS = 30          (was 50)                      │
+│  MIN_BUFFER_BYTES = 65536     (was 3072000, removes clamp)  │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -45,7 +46,7 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Key principle:** Hot path executes identical code regardless of buffer state or data size.
+**Key principle:** Decode and allocation paths execute identical code regardless of data size. Flow control may branch on buffer state but with bounded, predictable timing.
 
 ---
 
@@ -163,13 +164,25 @@ while (remainingSamples > 0 && retryCount < MAX_RETRIES) {
 ```cpp
 namespace DirettaBuffer {
     // Low-latency tuned values
-    constexpr float PCM_BUFFER_SECONDS = 0.3f;   // Was 1.0f (~300ms buffer)
+    constexpr float PCM_BUFFER_SECONDS = 0.3f;   // Was 1.0f (now 300ms buffer)
     constexpr size_t PCM_PREFILL_MS = 30;        // Was 50 (faster start)
 
-    // Keep conservative minimum for network variance
-    constexpr size_t MIN_BUFFER_BYTES = 921600;  // Was 3072000 (~300ms at 192kHz)
+    // Remove effective minimum clamp - let buffer size be purely rate-dependent
+    // Old MIN_BUFFER_BYTES = 3072000 clamped to ~5s at 44.1kHz, ~2s at 192kHz
+    // New value is just a sanity floor (64KB = ~370ms at 44.1kHz/16-bit)
+    constexpr size_t MIN_BUFFER_BYTES = 65536;
 }
 ```
+
+**Buffer size math:**
+
+| Sample Rate | Bit Depth | Channels | Bytes/sec | 300ms Buffer |
+|-------------|-----------|----------|-----------|--------------|
+| 44.1kHz | 16-bit | 2 | 176,400 | 52,920 bytes |
+| 96kHz | 24-bit | 2 | 576,000 | 172,800 bytes |
+| 192kHz | 32-bit | 2 | 1,536,000 | 460,800 bytes |
+
+With `PCM_BUFFER_SECONDS = 0.3f` and `MIN_BUFFER_BYTES = 65536`, the buffer is now truly rate-dependent and achieves ~300ms across all sample rates.
 
 **Changes to `src/DirettaRenderer.cpp`:**
 
@@ -187,49 +200,7 @@ size_t samplesPerCall = isDSD ? 32768 : 2048;  // Was 8192 for PCM
 
 ---
 
-## 5. Logging Gate
-
-**Solution:** First-N unthrottled + rate-limited after.
-
-```cpp
-class RateLimitedLogger {
-public:
-    bool shouldLog() {
-        if (m_count < FIRST_N_UNTHROTTLED) {
-            m_count++;
-            return true;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        if (now - m_lastLog >= THROTTLE_INTERVAL) {
-            m_lastLog = now;
-            return true;
-        }
-        return false;
-    }
-
-    void reset() {
-        m_count = 0;
-        m_lastLog = std::chrono::steady_clock::time_point{};
-    }
-
-private:
-    static constexpr int FIRST_N_UNTHROTTLED = 5;
-    static constexpr auto THROTTLE_INTERVAL = std::chrono::seconds(1);
-
-    int m_count = 0;
-    std::chrono::steady_clock::time_point m_lastLog{};
-};
-```
-
-**Behavior:**
-- First 5 occurrences: always log (startup diagnosis)
-- After that: max 1 log per second
-- Resets on track change
-
----
-
-## 6. Implementation Plan
+## 5. Implementation Plan
 
 **Files to modify:**
 
@@ -237,8 +208,8 @@ private:
 |------|---------|
 | `src/DirettaSync.h` | Update buffer constants for low-latency |
 | `src/DirettaRenderer.cpp` | Change chunk size; implement hybrid flow control |
-| `src/AudioEngine.h` | Add `m_packet`, `m_frame`, `m_resampleBuffer` members; add `RateLimitedLogger` |
-| `src/AudioEngine.cpp` | Refactor `readSamples()` to use reusable members; add logging gate |
+| `src/AudioEngine.h` | Add `m_packet`, `m_frame`, `m_resampleBuffer` members |
+| `src/AudioEngine.cpp` | Refactor `readSamples()` to use reusable members |
 
 **Implementation order:**
 
@@ -248,8 +219,7 @@ private:
 | 2 | Change chunk size | `src/DirettaRenderer.cpp:540` | Low |
 | 3 | Hybrid flow control | `src/DirettaRenderer.cpp:257-269` | Medium |
 | 4 | Per-call allocation elimination | `src/AudioEngine.cpp` | Medium |
-| 5 | Logging gate | `src/AudioEngine.cpp:930` | Low |
-| 6 | Integration test | - | Validation |
+| 5 | Integration test | - | Validation |
 
 **Testing strategy:**
 - Integration: Playback test, verify no underruns at 300ms buffer
@@ -264,7 +234,6 @@ private:
 - Buffer constant tuning (compile-time)
 - Per-call allocation elimination
 - Hybrid send loop (micro-sleep + early-return on critical)
-- Logging gate (first-N + rate-limit)
 
 **Out of scope:**
 - CLI flags for runtime configuration (future enhancement)
