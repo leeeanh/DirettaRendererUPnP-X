@@ -864,10 +864,15 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                         AV_ROUND_UP
                     );
 
-                    // CRITICAL FIX: Allouer un buffer temporaire pour TOUS les samples convertis
+                    // Reuse member buffer with capacity growth
                     size_t tempBufferSize = totalOutSamples * bytesPerSample;
-                    AudioBuffer tempBuffer(tempBufferSize);
-                    uint8_t* tempPtr = tempBuffer.data();
+                    if (tempBufferSize > m_resampleBufferCapacity) {
+                        // Grow with 50% headroom to reduce future reallocations
+                        size_t newCapacity = static_cast<size_t>(tempBufferSize * 1.5);
+                        m_resampleBuffer.resize(newCapacity);
+                        m_resampleBufferCapacity = m_resampleBuffer.size();
+                    }
+                    uint8_t* tempPtr = m_resampleBuffer.data();
 
                     // Convertir TOUTE la frame
                     int convertedSamples = swr_convert(
@@ -884,7 +889,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                         size_t bytesToUse = samplesToUse * bytesPerSample;
 
                         // Copier vers le buffer de sortie
-                        memcpy_audio(outputPtr, tempBuffer.data(), bytesToUse);
+                        memcpy_audio(outputPtr, m_resampleBuffer.data(), bytesToUse);
                         outputPtr += bytesToUse;
                         totalSamplesRead += samplesToUse;
 
@@ -900,7 +905,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
 
                             // Copier l'excédent
                             memcpy_audio(m_remainingSamples.data(),
-                                   tempBuffer.data() + bytesToUse,
+                                   m_resampleBuffer.data() + bytesToUse,
                                    excessBytes);
                             m_remainingCount = excess;
 
