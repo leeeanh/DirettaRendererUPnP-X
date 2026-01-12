@@ -176,11 +176,13 @@ namespace DirettaBuffer {
 
 **Buffer size math:**
 
-| Sample Rate | Bit Depth | Channels | Bytes/sec | 300ms Buffer |
-|-------------|-----------|----------|-----------|--------------|
+Note: 24-bit audio uses 4 bytes/sample internally (`AV_SAMPLE_FMT_S32`), not 3 bytes packed.
+
+| Sample Rate | Bit Depth | Internal Bytes/Sample | Bytes/sec | 300ms Buffer |
+|-------------|-----------|----------------------|-----------|--------------|
 | 44.1kHz | 16-bit | 2 | 176,400 | 52,920 bytes |
-| 96kHz | 24-bit | 2 | 576,000 | 172,800 bytes |
-| 192kHz | 32-bit | 2 | 1,536,000 | 460,800 bytes |
+| 96kHz | 24-bit | 4 | 768,000 | 230,400 bytes |
+| 192kHz | 32-bit | 4 | 1,536,000 | 460,800 bytes |
 
 With `PCM_BUFFER_SECONDS = 0.3f` and `MIN_BUFFER_BYTES = 65536`, the buffer is now truly rate-dependent and achieves ~300ms across all sample rates.
 
