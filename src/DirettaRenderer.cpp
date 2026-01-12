@@ -20,6 +20,14 @@
 extern bool g_verbose;
 #define DEBUG_LOG(x) if (g_verbose) { std::cout << x << std::endl; }
 
+// Hybrid flow control constants
+namespace FlowControl {
+    constexpr int MICROSLEEP_US = 500;
+    constexpr int MAX_WAIT_MS = 20;
+    constexpr int MAX_RETRIES = MAX_WAIT_MS * 1000 / MICROSLEEP_US;  // 40 retries
+    constexpr float CRITICAL_BUFFER_LEVEL = 0.10f;
+}
+
 //=============================================================================
 // UUID Generation
 //=============================================================================
@@ -245,16 +253,18 @@ bool DirettaRenderer::start() {
                         std::cerr << "[Callback] DSD timeout" << std::endl;
                     }
                 } else {
-                    // PCM: Incremental send
+                    // PCM: Incremental send with hybrid flow control
                     const uint8_t* audioData = buffer.data();
                     size_t remainingSamples = samples;
                     size_t bytesPerSample = (bitDepth == 24 || bitDepth == 32)
                         ? 4 * channels : (bitDepth / 8) * channels;
 
-                    int retryCount = 0;
-                    const int maxRetries = 50;
+                    float bufferLevel = m_direttaSync->getBufferLevel();
+                    bool criticalMode = (bufferLevel < FlowControl::CRITICAL_BUFFER_LEVEL);
 
-                    while (remainingSamples > 0 && retryCount < maxRetries) {
+                    int retryCount = 0;
+
+                    while (remainingSamples > 0 && retryCount < FlowControl::MAX_RETRIES) {
                         size_t sent = m_direttaSync->sendAudio(audioData, remainingSamples);
 
                         if (sent > 0) {
@@ -263,7 +273,11 @@ bool DirettaRenderer::start() {
                             audioData += sent;
                             retryCount = 0;
                         } else {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            if (criticalMode) {
+                                DEBUG_LOG("[Audio] Early-return, buffer critical: " << bufferLevel);
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::microseconds(FlowControl::MICROSLEEP_US));
                             retryCount++;
                         }
                     }
@@ -537,7 +551,8 @@ void DirettaRenderer::audioThreadFunc() {
             }
 
             // Adjust samples per call based on format
-            size_t samplesPerCall = isDSD ? 32768 : 8192;
+            // 2048 samples = ~46ms at 44.1kHz (was 8192 = ~186ms)
+            size_t samplesPerCall = isDSD ? 32768 : 2048;  // Was 8192 for PCM
 
             if (sampleRate != lastSampleRate || samplesPerCall != currentSamplesPerCall) {
                 currentSamplesPerCall = samplesPerCall;
