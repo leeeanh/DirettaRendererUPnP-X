@@ -13,13 +13,13 @@
 2. 10ms blocking sleeps on backpressure
 3. Fixed 8192-sample chunks regardless of buffer state
 
-**Solution:** A layered approach that eliminates allocations, adds adaptive flow control, and exposes CLI tuning.
+**Solution:** A layered approach that eliminates allocations, adds adaptive flow control, and tunes buffer constants for low latency.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  CLI Flags                                                  │
-│  --low-latency (preset: 300ms buffer, 30ms prefill, 2048)   │
-│  --pcm-buffer-ms=N  --pcm-prefill-ms=N  --chunk-size=N      │
+│  Compile-time Constants (src/DirettaSync.h)                 │
+│  PCM_BUFFER_SECONDS = 0.3f  (was 1.0f)                      │
+│  PCM_PREFILL_MS = 30        (was 50)                        │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -35,8 +35,9 @@
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  DirettaRenderer audio callback                             │
+│  DirettaRenderer (modified)                                 │
 │  ┌─────────────────────────────────────────────────────┐    │
+│  │  Chunk size: 2048 samples (was 8192)                │    │
 │  │  Hybrid flow control:                               │    │
 │  │  - Normal: 500µs sleep, 20ms cap                    │    │
 │  │  - Critical (<10% buffer): early-return             │    │
@@ -153,48 +154,36 @@ while (remainingSamples > 0 && retryCount < MAX_RETRIES) {
 
 ---
 
-## 4. CLI Interface
+## 4. Buffer Constants
 
-**New flags:**
+**Approach:** Tune compile-time `constexpr` values for low-latency operation. No runtime configuration needed initially.
 
-```
---low-latency           Enable low-latency mode (preset: 300ms buffer, 30ms prefill, 2048 chunk)
---pcm-buffer-ms=N       PCM buffer size in milliseconds (default: 1000)
---pcm-prefill-ms=N      PCM prefill before playback starts (default: 50)
---chunk-size=N          Samples per process() call (default: 8192)
-```
-
-**Precedence:** Individual flags override `--low-latency` preset.
-
-```bash
-# Use preset
-diretta-renderer --low-latency
-
-# Use preset but override chunk size
-diretta-renderer --low-latency --chunk-size=4096
-
-# Fully custom
-diretta-renderer --pcm-buffer-ms=500 --pcm-prefill-ms=40 --chunk-size=2048
-```
-
-**Configuration struct:**
+**Changes to `src/DirettaSync.h`:**
 
 ```cpp
-struct BufferConfig {
-    size_t pcmBufferMs = 1000;
-    size_t pcmPrefillMs = 50;
-    size_t chunkSize = 8192;
+namespace DirettaBuffer {
+    // Low-latency tuned values
+    constexpr float PCM_BUFFER_SECONDS = 0.3f;   // Was 1.0f (~300ms buffer)
+    constexpr size_t PCM_PREFILL_MS = 30;        // Was 50 (faster start)
 
-    static BufferConfig lowLatency() {
-        return { .pcmBufferMs = 300, .pcmPrefillMs = 30, .chunkSize = 2048 };
-    }
-};
+    // Keep conservative minimum for network variance
+    constexpr size_t MIN_BUFFER_BYTES = 921600;  // Was 3072000 (~300ms at 192kHz)
+}
 ```
 
-**Validation:**
-- `pcmBufferMs`: min 100, max 5000
-- `pcmPrefillMs`: min 10, max pcmBufferMs/2
-- `chunkSize`: must be power of 2, range 512-16384
+**Changes to `src/DirettaRenderer.cpp`:**
+
+```cpp
+// Smaller chunks for lower latency
+size_t samplesPerCall = isDSD ? 32768 : 2048;  // Was 8192 for PCM
+```
+
+**Rationale:**
+- 300ms buffer covers typical LAN jitter while reducing end-to-end latency
+- 2048 samples/call = ~46ms at 44.1kHz (was ~186ms) - tighter scheduling
+- 30ms prefill enables faster playback start
+
+**Future:** If runtime configurability is needed, these can be promoted to CLI flags later.
 
 ---
 
@@ -246,41 +235,39 @@ private:
 
 | File | Changes |
 |------|---------|
+| `src/DirettaSync.h` | Update buffer constants for low-latency |
+| `src/DirettaRenderer.cpp` | Change chunk size; implement hybrid flow control |
 | `src/AudioEngine.h` | Add `m_packet`, `m_frame`, `m_resampleBuffer` members; add `RateLimitedLogger` |
 | `src/AudioEngine.cpp` | Refactor `readSamples()` to use reusable members; add logging gate |
-| `src/DirettaRenderer.h` | Add `BufferConfig` struct |
-| `src/DirettaRenderer.cpp` | Hybrid flow control in audio callback; use config for chunk size |
-| `src/DirettaSync.h` | Make buffer constants non-constexpr, accept config |
-| `src/DirettaSync.cpp` | Use configurable buffer/prefill values |
-| `src/main.cpp` | Add CLI flag parsing, create `BufferConfig` |
 
 **Implementation order:**
 
-| Step | Task | Risk |
-|------|------|------|
-| 1 | CLI parsing + `BufferConfig` struct | Low |
-| 2 | Wire config to `DirettaSync` buffer sizing | Low |
-| 3 | Per-call allocation elimination in `AudioEngine` | Medium |
-| 4 | Hybrid flow control in audio callback | Medium |
-| 5 | Logging gate | Low |
-| 6 | Integration test with `--low-latency` | Validation |
+| Step | Task | File | Risk |
+|------|------|------|------|
+| 1 | Update buffer constants | `src/DirettaSync.h` | Low |
+| 2 | Change chunk size | `src/DirettaRenderer.cpp:540` | Low |
+| 3 | Hybrid flow control | `src/DirettaRenderer.cpp:257-269` | Medium |
+| 4 | Per-call allocation elimination | `src/AudioEngine.cpp` | Medium |
+| 5 | Logging gate | `src/AudioEngine.cpp:930` | Low |
+| 6 | Integration test | - | Validation |
 
 **Testing strategy:**
-- Unit: Verify `BufferConfig` validation, `RateLimitedLogger` behavior
-- Integration: Playback test with `--low-latency`, verify no underruns
-- Optional benchmark: Measure jitter variance before/after
+- Integration: Playback test, verify no underruns at 300ms buffer
+- Comparison: Before/after latency measurement (optional)
+- Stress: Network variance simulation (optional)
 
 ---
 
 ## Scope
 
 **In scope:**
+- Buffer constant tuning (compile-time)
 - Per-call allocation elimination
 - Hybrid send loop (micro-sleep + early-return on critical)
-- CLI flags: `--low-latency`, `--pcm-buffer-ms`, `--pcm-prefill-ms`, `--chunk-size`
 - Logging gate (first-N + rate-limit)
 
 **Out of scope:**
+- CLI flags for runtime configuration (future enhancement)
 - AVX2 micro-optimizations (zero hoist)
 - `memcpy_audio_fixed` for PCM ring writes (covered in memory optimization design)
 - Config file changes
