@@ -20,7 +20,7 @@
 │  Compile-time Constants (src/DirettaSync.h)                 │
 │  PCM_BUFFER_SECONDS = 0.3f    (was 1.0f)                    │
 │  PCM_PREFILL_MS = 30          (was 50)                      │
-│  MIN_BUFFER_BYTES = 65536     (was 3072000, removes clamp)  │
+│  MIN_BUFFER_BYTES = 65536     (was 3072000, small safety floor)  │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -167,9 +167,9 @@ namespace DirettaBuffer {
     constexpr float PCM_BUFFER_SECONDS = 0.3f;   // Was 1.0f (now 300ms buffer)
     constexpr size_t PCM_PREFILL_MS = 30;        // Was 50 (faster start)
 
-    // Remove effective minimum clamp - let buffer size be purely rate-dependent
+    // Reduce minimum clamp to a small safety floor
     // Old MIN_BUFFER_BYTES = 3072000 clamped to ~5s at 44.1kHz, ~2s at 192kHz
-    // New value is just a sanity floor (64KB = ~370ms at 44.1kHz/16-bit)
+    // New value: 64KB = ~370ms floor at 44.1kHz/16-bit, negligible at higher rates
     constexpr size_t MIN_BUFFER_BYTES = 65536;
 }
 ```
@@ -184,7 +184,7 @@ Note: 24-bit audio uses 4 bytes/sample internally (`AV_SAMPLE_FMT_S32`), not 3 b
 | 96kHz | 24-bit | 4 | 768,000 | 230,400 bytes |
 | 192kHz | 32-bit | 4 | 1,536,000 | 460,800 bytes |
 
-With `PCM_BUFFER_SECONDS = 0.3f` and `MIN_BUFFER_BYTES = 65536`, the buffer is now truly rate-dependent and achieves ~300ms across all sample rates.
+With `PCM_BUFFER_SECONDS = 0.3f` and `MIN_BUFFER_BYTES = 65536`, the buffer achieves ~300ms for most formats. The 64KB floor causes ~370ms at 44.1kHz/16-bit, but higher sample rates are unaffected.
 
 **Changes to `src/DirettaRenderer.cpp`:**
 
