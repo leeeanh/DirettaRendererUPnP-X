@@ -749,18 +749,21 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
         }
     }
 
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
+    // Lazy initialization of reusable members
+    if (!m_packet) {
+        m_packet = av_packet_alloc();
+    }
+    if (!m_frame) {
+        m_frame = av_frame_alloc();
+    }
 
-    if (!packet || !frame) {
-        if (packet) av_packet_free(&packet);
-        if (frame) av_frame_free(&frame);
-        return totalSamplesRead; // Retourner ce qu'on a déjà lu du buffer
+    if (!m_packet || !m_frame) {
+        return totalSamplesRead;
     }
 
     while (totalSamplesRead < numSamples && !m_eof) {
         // Read packet
-        int ret = av_read_frame(m_formatContext, packet);
+        int ret = av_read_frame(m_formatContext, m_packet);
 
         if (ret < 0) {
             // Log position when EOF occurs
@@ -793,14 +796,14 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
         }
 
         // Skip non-audio packets
-        if (packet->stream_index != m_audioStreamIndex) {
-            av_packet_unref(packet);
+        if (m_packet->stream_index != m_audioStreamIndex) {
+            av_packet_unref(m_packet);
             continue;
         }
 
         // Send packet to decoder
-        ret = avcodec_send_packet(m_codecContext, packet);
-        av_packet_unref(packet);
+        ret = avcodec_send_packet(m_codecContext, m_packet);
+        av_packet_unref(m_packet);
 
         if (ret < 0) {
             std::cerr << "[AudioDecoder] Error sending packet to decoder" << std::endl;
@@ -809,20 +812,18 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
 
         // Receive decoded frames
         while (ret >= 0 && totalSamplesRead < numSamples) {
-            ret = avcodec_receive_frame(m_codecContext, frame);
+            ret = avcodec_receive_frame(m_codecContext, m_frame);
 
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
                 break;
             } else if (ret < 0) {
                 std::cerr << "[AudioDecoder] Error receiving frame from decoder" << std::endl;
-                av_frame_unref(frame);
-                av_packet_free(&packet);
-                av_frame_free(&frame);
+                av_frame_unref(m_frame);
                 return totalSamplesRead;
             }
 
             // Process frame
-            size_t frameSamples = frame->nb_samples;
+            size_t frameSamples = m_frame->nb_samples;
 
             if (m_trackInfo.isDSD) {
                 // DSD: Direct copy (no resampling!)
@@ -835,13 +836,13 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                 }
 
                 // Copy DSD data
-                if (frame->format == AV_SAMPLE_FMT_U8) {
-                    memcpy_audio(outputPtr, frame->data[0], bytesToCopy);
-                } else if (frame->format == AV_SAMPLE_FMT_U8P) {
+                if (m_frame->format == AV_SAMPLE_FMT_U8) {
+                    memcpy_audio(outputPtr, m_frame->data[0], bytesToCopy);
+                } else if (m_frame->format == AV_SAMPLE_FMT_U8P) {
                     // Planar to interleaved
                     for (size_t i = 0; i < frameSamples; i++) {
                         for (uint32_t ch = 0; ch < m_trackInfo.channels; ch++) {
-                            *outputPtr++ = frame->data[ch][i];
+                            *outputPtr++ = m_frame->data[ch][i];
                         }
                     }
                     outputPtr -= bytesToCopy; // Reset pointer after increment
@@ -873,7 +874,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                         m_swrContext,
                         &tempPtr,
                         totalOutSamples,
-                        (const uint8_t**)frame->data,
+                        (const uint8_t**)m_frame->data,
                         frameSamples
                     );
 
@@ -915,7 +916,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                     size_t samplesToCopy = std::min(frameSamples, samplesNeeded);
                     size_t bytesToCopy = samplesToCopy * bytesPerSample;
 
-                    memcpy_audio(outputPtr, frame->data[0], bytesToCopy);
+                    memcpy_audio(outputPtr, m_frame->data[0], bytesToCopy);
                     outputPtr += bytesToCopy;
                     totalSamplesRead += samplesToCopy;
 
@@ -929,7 +930,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                         }
 
                         memcpy_audio(m_remainingSamples.data(),
-                               frame->data[0] + bytesToCopy,
+                               m_frame->data[0] + bytesToCopy,
                                excessBytes);
                         m_remainingCount = excess;
 
@@ -939,12 +940,13 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                 }
             }
 
-            av_frame_unref(frame);
+            av_frame_unref(m_frame);
         }
     }
 
-    av_packet_free(&packet);
-    av_frame_free(&frame);
+    // Unref for reuse (no deallocation)
+    av_packet_unref(m_packet);
+    av_frame_unref(m_frame);
 
     return totalSamplesRead;
 }
