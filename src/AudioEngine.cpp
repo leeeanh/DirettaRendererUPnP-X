@@ -78,7 +78,9 @@ AudioDecoder::AudioDecoder()
     , m_eof(false)
     , m_rawDSD(false)         // DSD mode off by default
     , m_packet(nullptr)       // Packet for raw reading
+    , m_frame(nullptr)        // Reusable frame for PCM decoding
     , m_remainingCount(0)
+    , m_resampleBufferCapacity(0)
 {
 }
 
@@ -516,7 +518,10 @@ void AudioDecoder::close() {
     if (m_codecContext) {
         avcodec_free_context(&m_codecContext);
     }
-    if (m_packet) {  // Free DSD packet
+    if (m_frame) {
+        av_frame_free(&m_frame);
+    }
+    if (m_packet) {
         av_packet_free(&m_packet);
     }
     if (m_formatContext) {
@@ -524,7 +529,8 @@ void AudioDecoder::close() {
     }
     m_audioStreamIndex = -1;
     m_eof = false;
-    m_rawDSD = false;  // Reset DSD flag
+    m_rawDSD = false;
+    m_resampleBufferCapacity = 0;  // Reset capacity tracking
 }
 
 size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
