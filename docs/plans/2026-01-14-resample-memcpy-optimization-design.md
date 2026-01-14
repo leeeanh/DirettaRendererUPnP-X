@@ -84,19 +84,26 @@ if ((size_t)maxOutput <= samplesNeeded) {
 
 ## 3. AVAudioFifo Integration
 
-**Replace `m_remainingSamples` + `m_remainingCount` + memmove with AVAudioFifo.**
+**Replace PCM overflow handling with AVAudioFifo. Keep DSD buffer separate.**
+
+**Current problem:** `m_remainingSamples`/`m_remainingCount` are shared between:
+- DSD path: byte-level L/R channel buffering (count = bytes)
+- PCM resample path: sample overflow (count = samples)
+- PCM passthrough path: frame overflow (count = samples)
+
+This overloading is fragile. Solution: separate concerns.
 
 **Member changes in AudioDecoder:**
 
 ```cpp
 class AudioDecoder {
 private:
-    // Remove:
-    // std::vector<uint8_t> m_remainingSamples;
-    // size_t m_remainingCount;
+    // KEEP for DSD (rename for clarity):
+    std::vector<uint8_t> m_dsdRemainderBuffer;  // was m_remainingSamples
+    size_t m_dsdRemainderCount = 0;              // was m_remainingCount (bytes)
 
-    // Add:
-    AVAudioFifo* m_audioFifo = nullptr;
+    // ADD for PCM (both resample and passthrough):
+    AVAudioFifo* m_pcmFifo = nullptr;
 };
 ```
 
@@ -104,51 +111,53 @@ private:
 
 | Event | Action |
 |-------|--------|
-| `initResampler()` | Allocate FIFO for output format (S16/S32, channels) |
+| `initResampler()` | Allocate PCM FIFO for output format (S16/S32, channels) |
 | Format/channel change | Free old FIFO, allocate new one |
-| `seek()` | `av_audio_fifo_reset(m_audioFifo)` |
-| `close()` | `av_audio_fifo_free(m_audioFifo)` |
+| `seek()` | `av_audio_fifo_reset(m_pcmFifo)` + `m_dsdRemainderCount = 0` |
+| `close()` | `av_audio_fifo_free(m_pcmFifo)` |
 
 **FIFO allocation (in initResampler):**
 
 ```cpp
 // Free existing FIFO if format changed
-if (m_audioFifo) {
-    av_audio_fifo_free(m_audioFifo);
-    m_audioFifo = nullptr;
+if (m_pcmFifo) {
+    av_audio_fifo_free(m_pcmFifo);
+    m_pcmFifo = nullptr;
 }
 
 // Allocate for output format
 AVSampleFormat fifoFormat = (outputBits == 16) ? AV_SAMPLE_FMT_S16 : AV_SAMPLE_FMT_S32;
-m_audioFifo = av_audio_fifo_alloc(fifoFormat, m_trackInfo.channels, 8192);
-if (!m_audioFifo) {
-    std::cerr << "[AudioDecoder] Failed to allocate audio FIFO" << std::endl;
+m_pcmFifo = av_audio_fifo_alloc(fifoFormat, m_trackInfo.channels, 8192);
+if (!m_pcmFifo) {
+    std::cerr << "[AudioDecoder] Failed to allocate PCM FIFO" << std::endl;
     return false;
 }
 ```
 
-**Reading from FIFO (top of readSamples, before decode loop):**
+**Reading from FIFO (top of PCM path in readSamples, before decode loop):**
 
 ```cpp
-// Drain FIFO first
-int fifoSamples = av_audio_fifo_size(m_audioFifo);
-if (fifoSamples > 0) {
-    int samplesToRead = std::min(fifoSamples, (int)(numSamples - totalSamplesRead));
-    uint8_t* outPtrs[1] = { outputPtr };
+// Drain PCM FIFO first (replaces old m_remainingSamples read)
+if (m_pcmFifo) {
+    int fifoSamples = av_audio_fifo_size(m_pcmFifo);
+    if (fifoSamples > 0) {
+        int samplesToRead = std::min(fifoSamples, (int)(numSamples - totalSamplesRead));
+        uint8_t* outPtrs[1] = { outputPtr };
 
-    int read = av_audio_fifo_read(m_audioFifo, (void**)outPtrs, samplesToRead);
-    if (read > 0) {
-        outputPtr += read * bytesPerSample;
-        totalSamplesRead += read;
-    }
+        int read = av_audio_fifo_read(m_pcmFifo, (void**)outPtrs, samplesToRead);
+        if (read > 0) {
+            outputPtr += read * bytesPerSample;
+            totalSamplesRead += read;
+        }
 
-    if (totalSamplesRead >= numSamples) {
-        return totalSamplesRead;
+        if (totalSamplesRead >= numSamples) {
+            return totalSamplesRead;
+        }
     }
 }
 ```
 
-**Writing excess to FIFO (temp buffer path):**
+**Writing excess to FIFO (resample path):**
 
 ```cpp
 if ((size_t)convertedSamples > samplesToUse) {
@@ -156,7 +165,32 @@ if ((size_t)convertedSamples > samplesToUse) {
     uint8_t* excessPtr = m_resampleBuffer.data() + samplesToUse * bytesPerSample;
     uint8_t* excessPtrs[1] = { excessPtr };
 
-    av_audio_fifo_write(m_audioFifo, (void**)excessPtrs, excess);
+    av_audio_fifo_write(m_pcmFifo, (void**)excessPtrs, excess);
+}
+```
+
+**Writing excess to FIFO (passthrough path - no resampler):**
+
+When `m_swrContext == nullptr`, decoded frames go directly to output. Excess must also go to FIFO:
+
+```cpp
+} else {
+    // No resampling - direct copy
+    size_t samplesToCopy = std::min(frameSamples, samplesNeeded);
+    size_t bytesToCopy = samplesToCopy * bytesPerSample;
+
+    memcpy_audio(outputPtr, m_frame->data[0], bytesToCopy);
+    outputPtr += bytesToCopy;
+    totalSamplesRead += samplesToCopy;
+
+    // Store excess in FIFO (replaces old m_remainingSamples)
+    if (frameSamples > samplesToCopy) {
+        size_t excess = frameSamples - samplesToCopy;
+        uint8_t* excessPtr = m_frame->data[0] + bytesToCopy;
+        uint8_t* excessPtrs[1] = { excessPtr };
+
+        av_audio_fifo_write(m_pcmFifo, (void**)excessPtrs, excess);
+    }
 }
 ```
 
@@ -168,7 +202,7 @@ if ((size_t)convertedSamples > samplesToUse) {
 
 | File | Changes |
 |------|---------|
-| `src/AudioEngine.h` | Add `AVAudioFifo* m_audioFifo`; remove `m_remainingSamples`, `m_remainingCount` |
+| `src/AudioEngine.h` | Add `AVAudioFifo* m_pcmFifo`; rename `m_remainingSamples` → `m_dsdRemainderBuffer`, `m_remainingCount` → `m_dsdRemainderCount` |
 | `src/AudioEngine.cpp` | Refactor `readSamples()`, update `initResampler()`, `seek()`, `close()` |
 
 **Implementation order:**
@@ -176,16 +210,20 @@ if ((size_t)convertedSamples > samplesToUse) {
 | Step | Task | Risk |
 |------|------|------|
 | 1 | Add `#include <libavutil/audio_fifo.h>` | None |
-| 2 | Replace member variables in header | Low |
-| 3 | Add FIFO alloc/free in `initResampler()` and `close()` | Low |
-| 4 | Add FIFO reset in `seek()` | Low |
-| 5 | Refactor `readSamples()`: drain FIFO at top | Medium |
-| 6 | Add direct write path (samplesNeeded >= maxOutput) | Medium |
-| 7 | Replace m_remainingSamples write with FIFO write | Low |
-| 8 | Remove old m_remainingSamples/memmove code | Low |
-| 9 | Test PCM playback (various sample rates/bit depths) | Validation |
+| 2 | Rename DSD buffer members in header | Low |
+| 3 | Add `AVAudioFifo* m_pcmFifo` member | Low |
+| 4 | Add FIFO alloc/free in `initResampler()` and `close()` | Low |
+| 5 | Add FIFO reset in `seek()` (alongside DSD buffer clear) | Low |
+| 6 | Update DSD path to use renamed members | Low |
+| 7 | Refactor PCM path: drain FIFO at top (replaces old m_remainingSamples read) | Medium |
+| 8 | Add direct write path for resample (samplesNeeded >= maxOutput) | Medium |
+| 9 | Update resample excess to use FIFO write | Low |
+| 10 | Update passthrough excess to use FIFO write | Low |
+| 11 | Remove old memmove code from PCM path | Low |
+| 12 | Test PCM playback (various sample rates/bit depths) | Validation |
+| 13 | Test DSD playback (verify no regression) | Validation |
 
-**DSD path:** No changes needed. The DSD native mode (`m_rawDSD`) has its own buffer handling and doesn't use the resampler.
+**DSD path:** Uses renamed `m_dsdRemainderBuffer`/`m_dsdRemainderCount`. Logic unchanged, just clearer naming.
 
 ---
 
@@ -197,8 +235,11 @@ if ((size_t)convertedSamples > samplesToUse) {
 |------|---------|
 | Play 44.1kHz/16-bit FLAC | Common case, verify basic playback |
 | Play 96kHz/24-bit FLAC | Higher rate, exercises resampler |
-| Play 192kHz/32-bit WAV | Uncompressed, tests direct path |
-| Seek mid-track | Verify FIFO reset works |
+| Play 192kHz/32-bit WAV | Uncompressed, tests passthrough + FIFO |
+| Play DSD64 DSF | Verify DSD buffer rename didn't break anything |
+| Play DSD128 DFF | Verify DSD bit reversal still works |
+| Seek mid-track (PCM) | Verify FIFO reset works |
+| Seek mid-track (DSD) | Verify DSD buffer clear works |
 | Gapless transition (same format) | Verify FIFO drains correctly between tracks |
 | Format change between tracks | Verify FIFO recreated properly |
 
@@ -209,7 +250,9 @@ if ((size_t)convertedSamples > samplesToUse) {
 | FIFO empty at start | Skip FIFO read, go straight to decode |
 | Direct path fits exactly | No excess, FIFO stays empty |
 | Small samplesNeeded (< maxOutput) | Uses temp buffer path, excess to FIFO |
+| Passthrough with large frame | Excess goes to FIFO, not dropped |
 | Seek while FIFO has data | FIFO cleared, no stale audio |
+| DSD with partial packet | Excess stored in m_dsdRemainderBuffer |
 
 **Performance validation (optional):**
 - Before/after comparison of CPU usage during playback
@@ -221,10 +264,10 @@ if ((size_t)convertedSamples > samplesToUse) {
 
 **In scope:**
 - Direct write optimization for resample path
-- AVAudioFifo to replace memmove-based leftover handling
+- AVAudioFifo for PCM overflow (both resample and passthrough)
+- Rename DSD buffer members for clarity
 - FIFO lifecycle management (init, seek, close)
 
 **Out of scope:**
-- DSD path changes (uses separate buffer logic)
-- No-resampling path (already efficient)
+- DSD buffer logic changes (just renamed, not restructured)
 - Runtime configuration
