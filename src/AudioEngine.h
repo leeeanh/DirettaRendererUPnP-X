@@ -13,6 +13,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswresample/swresample.h>
+#include <libavutil/audio_fifo.h>
 }
 
 /**
@@ -128,11 +129,12 @@ private:
     AVPacket* m_packet;      // Reusable for raw packet reading (DSD and PCM)
     AVFrame* m_frame;        // Reusable for decoded frames (PCM)
 
-    // CRITICAL: Buffer interne pour les samples excédentaires
-    // Quand une frame décodée contient plus de samples que demandé,
-    // on garde l'excédent ici pour le prochain appel
-    AudioBuffer m_remainingSamples;
-    size_t m_remainingCount;
+    // DSD remainder buffer (byte-level L/R channel buffering)
+    AudioBuffer m_dsdRemainderBuffer;
+    size_t m_dsdRemainderCount;
+
+    // PCM FIFO for sample overflow (O(1) circular buffer)
+    AVAudioFifo* m_pcmFifo = nullptr;
 
     // Reusable resample buffer (eliminates per-call allocation)
     AudioBuffer m_resampleBuffer;

@@ -76,10 +76,11 @@ AudioDecoder::AudioDecoder()
     , m_swrContext(nullptr)
     , m_audioStreamIndex(-1)
     , m_eof(false)
-    , m_rawDSD(false)         // DSD mode off by default
-    , m_packet(nullptr)       // Packet for raw reading
-    , m_frame(nullptr)        // Reusable frame for PCM decoding
-    , m_remainingCount(0)
+    , m_rawDSD(false)
+    , m_packet(nullptr)
+    , m_frame(nullptr)
+    , m_dsdRemainderCount(0)
+    , m_pcmFifo(nullptr)
     , m_resampleBufferCapacity(0)
 {
 }
@@ -524,13 +525,17 @@ void AudioDecoder::close() {
     if (m_packet) {
         av_packet_free(&m_packet);
     }
+    if (m_pcmFifo) {
+        av_audio_fifo_free(m_pcmFifo);
+        m_pcmFifo = nullptr;
+    }
     if (m_formatContext) {
         avformat_close_input(&m_formatContext);
     }
     m_audioStreamIndex = -1;
     m_eof = false;
     m_rawDSD = false;
-    m_resampleBufferCapacity = 0;  // Reset capacity tracking
+    m_resampleBufferCapacity = 0;
 }
 
 size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
@@ -561,28 +566,28 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
         }
 
         // Use remaining data from previous reads
-        if (m_remainingCount > 0) {
-            size_t remainingPerCh = m_remainingCount / 2;
+        if (m_dsdRemainderCount > 0) {
+            size_t remainingPerCh = m_dsdRemainderCount / 2;
             size_t toUse = std::min(remainingPerCh, bytesPerChannelNeeded);
 
             leftData.insert(leftData.end(),
-                           m_remainingSamples.data(),
-                           m_remainingSamples.data() + toUse);
+                           m_dsdRemainderBuffer.data(),
+                           m_dsdRemainderBuffer.data() + toUse);
             rightData.insert(rightData.end(),
-                            m_remainingSamples.data() + remainingPerCh,
-                            m_remainingSamples.data() + remainingPerCh + toUse);
+                            m_dsdRemainderBuffer.data() + remainingPerCh,
+                            m_dsdRemainderBuffer.data() + remainingPerCh + toUse);
 
             if (toUse < remainingPerCh) {
                 size_t leftover = remainingPerCh - toUse;
-                memmove(m_remainingSamples.data(),
-                        m_remainingSamples.data() + toUse,
+                memmove(m_dsdRemainderBuffer.data(),
+                        m_dsdRemainderBuffer.data() + toUse,
                         leftover);
-                memmove(m_remainingSamples.data() + leftover,
-                        m_remainingSamples.data() + remainingPerCh + toUse,
+                memmove(m_dsdRemainderBuffer.data() + leftover,
+                        m_dsdRemainderBuffer.data() + remainingPerCh + toUse,
                         leftover);
-                m_remainingCount = leftover * 2;
+                m_dsdRemainderCount = leftover * 2;
             } else {
-                m_remainingCount = 0;
+                m_dsdRemainderCount = 0;
             }
         }
 
@@ -633,12 +638,12 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
             // Save excess
             if (toTake < blockSize) {
                 size_t excess = blockSize - toTake;
-                if (m_remainingSamples.size() < excess * 2) {
-                    m_remainingSamples.resize(excess * 2);
+                if (m_dsdRemainderBuffer.size() < excess * 2) {
+                    m_dsdRemainderBuffer.resize(excess * 2);
                 }
-                memcpy_audio(m_remainingSamples.data(), pktL + toTake, excess);
-                memcpy_audio(m_remainingSamples.data() + excess, pktR + toTake, excess);
-                m_remainingCount = excess * 2;
+                memcpy_audio(m_dsdRemainderBuffer.data(), pktL + toTake, excess);
+                memcpy_audio(m_dsdRemainderBuffer.data() + excess, pktR + toTake, excess);
+                m_dsdRemainderCount = excess * 2;
             }
 
             av_packet_unref(m_packet);
@@ -725,25 +730,20 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
 
     uint8_t* outputPtr = buffer.data();
 
-    // CRITICAL FIX: D'abord, utiliser les samples restants du buffer interne
-    if (m_remainingCount > 0) {
-        size_t samplesToUse = std::min(m_remainingCount, numSamples);
-        memcpy_audio(outputPtr, m_remainingSamples.data(), samplesToUse * bytesPerSample);
-        outputPtr += samplesToUse * bytesPerSample;
-        totalSamplesRead += samplesToUse;
+    // First, drain any samples from FIFO (O(1) read from circular buffer)
+    if (m_pcmFifo && av_audio_fifo_size(m_pcmFifo) > 0) {
+        int fifoSamples = av_audio_fifo_size(m_pcmFifo);
+        int samplesToRead = std::min(fifoSamples, (int)numSamples);
 
-        // S'il reste encore des samples dans le buffer interne, les décaler
-        if (samplesToUse < m_remainingCount) {
-            size_t remaining = m_remainingCount - samplesToUse;
-            memmove(m_remainingSamples.data(),
-                    m_remainingSamples.data() + samplesToUse * bytesPerSample,
-                    remaining * bytesPerSample);
-            m_remainingCount = remaining;
-        } else {
-            m_remainingCount = 0;
+        uint8_t* readPtrs[1] = { outputPtr };
+        int samplesRead = av_audio_fifo_read(m_pcmFifo, (void**)readPtrs, samplesToRead);
+
+        if (samplesRead > 0) {
+            outputPtr += samplesRead * bytesPerSample;
+            totalSamplesRead += samplesRead;
         }
 
-        // Si on a déjà assez de samples, retourner maintenant
+        // If we have enough samples, return now
         if (totalSamplesRead >= numSamples) {
             return totalSamplesRead;
         }
@@ -884,35 +884,26 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                     );
 
                     if (convertedSamples > 0) {
-                        // Déterminer combien on peut utiliser maintenant
                         size_t samplesToUse = std::min((size_t)convertedSamples, samplesNeeded);
                         size_t bytesToUse = samplesToUse * bytesPerSample;
 
-                        // Copier vers le buffer de sortie
+                        // Copy needed samples to output
                         memcpy_audio(outputPtr, m_resampleBuffer.data(), bytesToUse);
                         outputPtr += bytesToUse;
                         totalSamplesRead += samplesToUse;
 
-                        // CRITICAL: S'il reste des samples, les stocker dans le buffer interne
-                        if ((size_t)convertedSamples > samplesToUse) {
+                        // Store excess in FIFO (O(1) write, replaces manual buffer)
+                        if ((size_t)convertedSamples > samplesToUse && m_pcmFifo) {
                             size_t excess = convertedSamples - samplesToUse;
-                            size_t excessBytes = excess * bytesPerSample;
+                            uint8_t* excessPtr = m_resampleBuffer.data() + bytesToUse;
+                            uint8_t* excessPtrs[1] = { excessPtr };
 
-                            // Redimensionner le buffer interne si nécessaire
-                            if (m_remainingSamples.size() < excessBytes) {
-                                m_remainingSamples.resize(excessBytes);
-                            }
-
-                            // Copier l'excédent
-                            memcpy_audio(m_remainingSamples.data(),
-                                   m_resampleBuffer.data() + bytesToUse,
-                                   excessBytes);
-                            m_remainingCount = excess;
-
-                            if (!m_resamplerInitLogged) {
-                                std::cout << "[AudioDecoder] Buffering " << excess
-                                          << " excess samples for next read" << std::endl;
-                                m_resamplerInitLogged = true;
+                            int written = av_audio_fifo_write(m_pcmFifo, (void**)excessPtrs, excess);
+                            if (written < 0) {
+                                std::cerr << "[AudioDecoder] FIFO write failed: " << written << std::endl;
+                            } else if ((size_t)written != excess) {
+                                std::cerr << "[AudioDecoder] FIFO partial write: " << written
+                                          << "/" << excess << " samples" << std::endl;
                             }
                         }
                     }
@@ -925,22 +916,19 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                     outputPtr += bytesToCopy;
                     totalSamplesRead += samplesToCopy;
 
-                    // CRITICAL: S'il reste des samples dans la frame, les stocker
-                    if (frameSamples > samplesToCopy) {
+                    // Store excess in FIFO (O(1) write, replaces manual buffer)
+                    if (frameSamples > samplesToCopy && m_pcmFifo) {
                         size_t excess = frameSamples - samplesToCopy;
-                        size_t excessBytes = excess * bytesPerSample;
+                        uint8_t* excessPtr = m_frame->data[0] + bytesToCopy;
+                        uint8_t* excessPtrs[1] = { excessPtr };
 
-                        if (m_remainingSamples.size() < excessBytes) {
-                            m_remainingSamples.resize(excessBytes);
+                        int written = av_audio_fifo_write(m_pcmFifo, (void**)excessPtrs, excess);
+                        if (written < 0) {
+                            std::cerr << "[AudioDecoder] FIFO write failed: " << written << std::endl;
+                        } else if ((size_t)written != excess) {
+                            std::cerr << "[AudioDecoder] FIFO partial write: " << written
+                                      << "/" << excess << " samples" << std::endl;
                         }
-
-                        memcpy_audio(m_remainingSamples.data(),
-                               m_frame->data[0] + bytesToCopy,
-                               excessBytes);
-                        m_remainingCount = excess;
-
-                        std::cout << "[AudioDecoder] Buffering " << excess
-                                  << " excess samples (no resampling)" << std::endl;
                     }
                 }
             }
@@ -1008,6 +996,18 @@ bool AudioDecoder::initResampler(uint32_t outputRate, uint32_t outputBits) {
     // Initialize resampler
     if (swr_init(m_swrContext) < 0) {
         std::cerr << "[AudioDecoder] Failed to initialize resampler" << std::endl;
+        swr_free(&m_swrContext);
+        return false;
+    }
+
+    // Initialize PCM FIFO for overflow handling (O(1) circular buffer)
+    if (m_pcmFifo) {
+        av_audio_fifo_free(m_pcmFifo);
+        m_pcmFifo = nullptr;
+    }
+    m_pcmFifo = av_audio_fifo_alloc(outFormat, m_trackInfo.channels, 8192);
+    if (!m_pcmFifo) {
+        std::cerr << "[AudioDecoder] Failed to allocate PCM FIFO" << std::endl;
         swr_free(&m_swrContext);
         return false;
     }
@@ -1592,7 +1592,7 @@ bool AudioDecoder::seek(double seconds) {
         }
 
         // Clear stale buffered data from before the seek
-        m_remainingCount = 0;
+        m_dsdRemainderCount = 0;
         m_eof = false;
 
         // Reset packet counter for cleaner debug output
@@ -1627,8 +1627,10 @@ bool AudioDecoder::seek(double seconds) {
         avcodec_flush_buffers(m_codecContext);
     }
 
-    // Réinitialiser les buffers internes
-    m_remainingCount = 0;
+    // Reset PCM FIFO (clear stale samples)
+    if (m_pcmFifo) {
+        av_audio_fifo_reset(m_pcmFifo);
+    }
     m_eof = false;
 
     std::cout << "[AudioDecoder] Seek successful to ~" << seconds << "s" << std::endl;
