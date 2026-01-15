@@ -16,27 +16,41 @@ This design implements five optimizations to eliminate unnecessary audio process
 
 **Solution:** Detect when formats match exactly and skip SwrContext creation entirely.
 
-In `AudioDecoder::open()`, after opening codec:
+**CRITICAL:** Request packed format BEFORE `avcodec_open2()` - FFmpeg ignores it afterward.
+
+In `AudioDecoder::open()`, after `avcodec_parameters_to_context()` but BEFORE `avcodec_open2()`:
 
 ```cpp
-// Request packed output format from decoder
+// Request packed output format from decoder (integer formats ONLY)
+// IMPORTANT: Float formats (FLT, FLTP) are NOT eligible for bypass
+// because downstream expects signed integer PCM. Float would corrupt audio.
 AVSampleFormat preferredFormat = AV_SAMPLE_FMT_NONE;
-if (m_codecContext->sample_fmt == AV_SAMPLE_FMT_S16P)
+AVSampleFormat srcFmt = m_codecContext->sample_fmt;
+
+if (srcFmt == AV_SAMPLE_FMT_S16P)
     preferredFormat = AV_SAMPLE_FMT_S16;
-else if (m_codecContext->sample_fmt == AV_SAMPLE_FMT_S32P)
+else if (srcFmt == AV_SAMPLE_FMT_S32P)
     preferredFormat = AV_SAMPLE_FMT_S32;
-else if (m_codecContext->sample_fmt == AV_SAMPLE_FMT_FLTP)
-    preferredFormat = AV_SAMPLE_FMT_FLT;
+// NOTE: Do NOT request FLT for FLTP - float bypass would corrupt audio
 
 if (preferredFormat != AV_SAMPLE_FMT_NONE) {
     m_codecContext->request_sample_fmt = preferredFormat;
+}
+
+// NOW open the codec
+if (avcodec_open2(m_codecContext, codec, nullptr) < 0) {
+    // error handling...
 }
 ```
 
 In `AudioDecoder::initResampler()`:
 
 ```cpp
+// Check if bypass is possible (integer formats only)
+bool isIntegerFormat = (m_codecContext->sample_fmt == AV_SAMPLE_FMT_S16 ||
+                        m_codecContext->sample_fmt == AV_SAMPLE_FMT_S32);
 bool canBypass =
+    isIntegerFormat &&
     (m_codecContext->sample_rate == outputRate) &&
     (m_codecContext->ch_layout.nb_channels == m_trackInfo.channels) &&
     formatMatchesOutput(m_codecContext->sample_fmt, outputBits);
@@ -45,9 +59,12 @@ if (canBypass) {
     m_bypassMode = true;
     // Skip SwrContext creation entirely
     // Still create m_pcmFifo for overflow handling
+    DEBUG_LOG("[AudioDecoder] PCM BYPASS enabled - bit-perfect path");
     return true;
 }
 ```
+
+**IMPORTANT:** Float formats (FLT, FLTP from AAC/Vorbis/etc.) are NEVER bypassed. The downstream pipeline (DirettaSync, ring buffer) interprets 32-bit as signed integer. Bypassing float would produce corrupted audio. SwrContext handles float→S32 conversion.
 
 **New members in AudioDecoder:**
 - `bool m_bypassMode = false;`
@@ -56,7 +73,9 @@ if (canBypass) {
 
 **Problem:** FFmpeg decoders often output planar formats (S16P, S32P, FLTP) requiring conversion.
 
-**Solution:** Use `request_sample_fmt` to ask decoder for packed output. If decoder honors the request, bypass is enabled; if not, fall back to SwrContext.
+**Solution:** Use `request_sample_fmt` to ask decoder for packed integer output BEFORE codec open. If decoder honors the request and produces S16/S32, bypass is enabled; if it produces float or planar, fall back to SwrContext.
+
+**Float handling:** Codecs like AAC/Vorbis output FLTP. We do NOT request FLT because float bypass would corrupt audio. These codecs always go through SwrContext for float→integer conversion.
 
 This is integrated with optimization #1 above.
 
@@ -102,6 +121,68 @@ S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) {
 
 **New members in DirettaRingBuffer:**
 - `S24PackMode m_s24MetadataHint = S24PackMode::Unknown;`
+- `void setS24PackHint(S24PackMode hint) { m_s24MetadataHint = hint; }`
+
+**API propagation path for metadata hint:**
+
+The hint must flow from FFmpeg decoder metadata to the ring buffer. Data path:
+
+```
+AudioDecoder (has codecpar->bits_per_raw_sample)
+    ↓ via TrackInfo or AudioCallback
+DirettaRenderer (receives track info)
+    ↓ via DirettaSync API
+DirettaSync (owns ring buffer)
+    ↓ via new setter
+DirettaRingBuffer (uses hint)
+```
+
+**Implementation:**
+
+1. In `AudioEngine.h`, extend `TrackInfo`:
+```cpp
+struct TrackInfo {
+    // ... existing fields ...
+
+    // 24-bit alignment hint from FFmpeg (for S24_P32 packing)
+    enum class S24Alignment { Unknown, LsbAligned, MsbAligned };
+    S24Alignment s24Alignment = S24Alignment::Unknown;
+};
+```
+
+2. In `AudioDecoder::open()`, detect alignment from FFmpeg:
+```cpp
+// Detect 24-bit alignment from codec parameters
+if (m_trackInfo.bitDepth == 24) {
+    // FFmpeg's bits_per_coded_sample vs bits_per_raw_sample indicates alignment
+    // If bits_per_coded_sample == 32 and bits_per_raw_sample == 24: LSB-aligned (common)
+    // If bits_per_coded_sample == 24: tightly packed, assume LSB
+    if (codecpar->bits_per_coded_sample == 32) {
+        m_trackInfo.s24Alignment = TrackInfo::S24Alignment::LsbAligned;
+    }
+    // Some DACs/formats use MSB alignment - detect from codec ID if known
+}
+```
+
+3. In `DirettaSync.h`, add setter:
+```cpp
+void setS24PackHint(S24PackMode hint) {
+    m_ringBuffer.setS24PackHint(hint);
+}
+```
+
+4. In `DirettaRenderer` (or audio callback), propagate on track change:
+```cpp
+void onTrackChange(const TrackInfo& info) {
+    if (info.bitDepth == 24 && info.s24Alignment != TrackInfo::S24Alignment::Unknown) {
+        S24PackMode hint = (info.s24Alignment == TrackInfo::S24Alignment::MsbAligned)
+            ? S24PackMode::MsbAligned : S24PackMode::LsbAligned;
+        m_direttaSync->setS24PackHint(hint);
+    } else {
+        m_direttaSync->setS24PackHint(S24PackMode::Unknown);  // Use detection
+    }
+}
+```
 
 ### 4. Adaptive PCM Chunk Sizing
 
@@ -177,10 +258,15 @@ if (m_bypassMode) {
 
 **Initialization flow in `AudioDecoder::open()`:**
 
-1. Open codec (existing)
-2. Request packed format (NEW)
-3. Open codec with `avcodec_open2()` (existing)
-4. Store actual output format for bypass detection
+1. `avformat_open_input()` - open container (existing)
+2. `avformat_find_stream_info()` - find streams (existing)
+3. `avcodec_find_decoder()` - find decoder (existing)
+4. `avcodec_alloc_context3()` - allocate codec context (existing)
+5. `avcodec_parameters_to_context()` - copy params (existing)
+6. **Request packed integer format (NEW)** - set `request_sample_fmt` for S16P→S16, S32P→S32 (NOT for FLTP)
+7. `avcodec_open2()` - open codec (existing, but AFTER step 6)
+8. Store actual output format for bypass detection
+9. Detect S24 alignment hint from `bits_per_coded_sample` (NEW)
 
 **First call to `readSamples()` - lazy resampler init:**
 
@@ -210,33 +296,44 @@ if (m_bypassMode) {
 
 | File | Changes |
 |------|---------|
-| `src/AudioEngine.h` | Add `m_bypassMode`, `m_resamplerInitialized`, `m_actualDecoderFormat`, `BufferLevelCallback`, `getAdaptiveChunkSize()` |
-| `src/AudioEngine.cpp` | Packed format request in `open()`, bypass detection in `initResampler()`, bypass path in `readSamples()`, dynamic FIFO sizing, adaptive chunk sizing |
-| `src/DirettaRingBuffer.h` | Add `S24PackMode::Deferred`, `m_s24MetadataHint`, enhanced `detectS24PackMode()` with hybrid logic, deferred handling in `push24BitPacked()` |
-| `src/DirettaSync.h` | No changes (already has `getBufferLevel()`) |
+| `src/AudioEngine.h` | Add `m_bypassMode`, `m_resamplerInitialized`, `m_actualDecoderFormat`, `BufferLevelCallback`, `getAdaptiveChunkSize()`, extend `TrackInfo` with `S24Alignment` enum |
+| `src/AudioEngine.cpp` | Packed format request BEFORE `avcodec_open2()`, bypass detection in `initResampler()` (integer formats only), bypass path in `readSamples()`, dynamic FIFO sizing, adaptive chunk sizing, S24 alignment detection |
+| `src/DirettaRingBuffer.h` | Add `S24PackMode::Deferred`, `m_s24MetadataHint`, `setS24PackHint()`, enhanced `detectS24PackMode()` with hybrid logic, deferred handling in `push24BitPacked()` |
+| `src/DirettaSync.h` | Add `setS24PackHint()` to propagate hint to ring buffer |
+| `src/DirettaRenderer.cpp` | Propagate S24 alignment hint on track change via `DirettaSync::setS24PackHint()` |
 
 ## Edge Cases
 
 | Scenario | Behavior |
 |----------|----------|
 | Decoder ignores packed request | `canBypass()` returns false, uses swr |
+| Decoder outputs float (FLT/FLTP) | Bypass explicitly disabled, swr converts to S32 |
+| AAC/Vorbis/MP3 streams | Always use swr (these output float), no bypass |
+| FLAC/ALAC/WAV streams | May bypass if decoder outputs S16/S32 and rate matches |
 | Mid-stream format change | Reset `m_resamplerInitialized`, re-evaluate bypass |
 | Seek operation | FIFO reset (existing), bypass state preserved |
 | 24-bit silence at start | Deferred detection, LSB default after 500ms timeout |
 | Buffer callback not set | `getAdaptiveChunkSize()` returns `maxSamples` unchanged |
+| S24 hint not propagated | Falls back to sample-based detection (existing behavior) |
 
 ## Risk Assessment
 
 | Risk | Mitigation |
 |------|------------|
-| Bypass incorrectly enabled | Conservative `canBypass()` checks rate, format, and layout |
+| Bypass incorrectly enabled | Conservative `canBypass()` requires integer format (S16/S32), matching rate, and matching layout |
+| Float bypass corruption | Float formats explicitly excluded from bypass check |
+| request_sample_fmt ignored | Check actual format after `avcodec_open2()`, not requested format |
 | FIFO too small at edge rates | Clamped to safe minimum 4096 samples |
 | Deferred detection never resolves | Timeout with LSB default after 500ms |
 | Adaptive sizing causes underrun | Deadband prevents over-correction, MIN_SCALE = 0.25 |
+| S24 hint propagation breaks | Graceful fallback to sample detection if hint is Unknown |
 
 ## Testing
 
-1. Compare byte-for-byte output with bypass enabled vs disabled for known PCM files
-2. Verify no SwrContext allocation in logs for matching formats
-3. Test with silence-leading tracks for 24-bit detection
-4. Monitor buffer levels during playback to verify adaptive sizing
+1. Compare byte-for-byte output with bypass enabled vs disabled for known PCM files (FLAC, WAV)
+2. Verify no SwrContext allocation in logs for matching integer formats
+3. Verify SwrContext IS created for float formats (AAC, Vorbis, MP3) - bypass must NOT activate
+4. Test with silence-leading tracks for 24-bit detection
+5. Monitor buffer levels during playback to verify adaptive sizing
+6. Test S24 hint propagation by checking logs for "hint: LsbAligned" on 24-bit FLAC
+7. Verify `request_sample_fmt` is set BEFORE `avcodec_open2()` in debug logs
