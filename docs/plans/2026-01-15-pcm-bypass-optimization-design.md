@@ -342,11 +342,11 @@ if (m_bypassMode) {
 
 | File | Changes |
 |------|---------|
-| `src/AudioEngine.h` | Add `m_bypassMode`, `m_resamplerInitialized`, `m_actualDecoderFormat`, `BufferLevelCallback`, `getAdaptiveChunkSize()`, extend `TrackInfo` with `S24Alignment` enum |
-| `src/AudioEngine.cpp` | Packed format request BEFORE `avcodec_open2()`, bypass detection in `initResampler()` (integer formats only), bypass path in `readSamples()`, dynamic FIFO sizing, adaptive chunk sizing, S24 alignment detection |
-| `src/DirettaRingBuffer.h` | Add `S24PackMode::Deferred`, `m_s24MetadataHint`, `setS24PackHint()`, enhanced `detectS24PackMode()` with hybrid logic, deferred handling in `push24BitPacked()` |
-| `src/DirettaSync.h` | Add `setS24PackHint()` to propagate hint to ring buffer |
-| `src/DirettaRenderer.cpp` | Propagate S24 alignment hint on track change via `DirettaSync::setS24PackHint()` |
+| `src/AudioEngine.h` | Add `m_bypassMode`, `m_resamplerInitialized` to `AudioDecoder`; extend `TrackInfo` with `S24Alignment` enum |
+| `src/AudioEngine.cpp` | Packed format request BEFORE `avcodec_open2()` (line 236) with capability check; bypass flag check (line 710); dynamic FIFO sizing (line 1027); S24 alignment detection |
+| `src/DirettaRingBuffer.h` | Add `S24PackMode::Deferred`, `m_s24MetadataHint`, `setS24PackHint()`, `setSampleRate()`, `m_deferredSampleCount`; enhanced `detectS24PackMode()` with sample-first priority; timeout handling in `push24BitPacked()` |
+| `src/DirettaSync.h` | Add `setS24PackHint()` to propagate hint; call `setSampleRate()` in `open()` |
+| `src/DirettaRenderer.cpp` | Wire adaptive chunk sizing in `audioThreadFunc()` (lines 533, 578); add `calculateAdaptiveChunkSize()` helper; propagate S24 hint on track change |
 
 ## Edge Cases
 
@@ -394,3 +394,88 @@ if (m_bypassMode) {
 9. Test 384kHz playback - verify FIFO size is 32768 (not collapsed to 4096)
 10. Test gapless transition between tracks with different S24 alignment
 11. Test MSB-aligned 24-bit source - verify sample detection overrides LSB hint
+
+## Implementation Notes (from review)
+
+These clarifications address specific codebase integration points:
+
+### 1. PCM Bypass Init Flag
+
+**Issue:** `readSamples()` calls `initResampler()` whenever `m_swrContext` is null (src/AudioEngine.cpp:710). Without a flag, bypass mode would continually try to create a resampler.
+
+**Solution:** Add `m_resamplerInitialized` flag to `AudioDecoder`:
+
+```cpp
+// In readSamples(), replace current check:
+if (!m_swrContext) {  // OLD - keeps trying
+
+// With:
+if (!m_resamplerInitialized && !m_trackInfo.isDSD) {
+    m_bypassMode = canBypass(outputRate, outputBits);
+    if (!m_bypassMode) {
+        initResampler(outputRate, outputBits);
+    }
+    initFifo(outputRate, m_bypassMode);  // FIFO needed even in bypass
+    m_resamplerInitialized = true;
+}
+```
+
+**Existing code reuse:** The no-resample direct copy path already exists (src/AudioEngine.cpp:930). Bypass mode can reuse it once `initResampler()` is skipped.
+
+### 2. S24 Deferred Timeout
+
+**Issue:** `DirettaRingBuffer` has no timing context. The "500ms timeout" cannot be implemented without sample-rate or timestamp information.
+
+**Solution:** Add sample-rate setter from `DirettaSync` (which knows rate):
+
+```cpp
+// In DirettaRingBuffer.h
+void setSampleRate(uint32_t rate) { m_sampleRate = rate; }
+
+// In push24BitPacked(), track samples processed:
+if (m_s24PackMode == S24PackMode::Deferred) {
+    m_deferredSampleCount += numSamples;
+    // Timeout: 500ms worth of samples
+    if (m_sampleRate > 0 && m_deferredSampleCount > m_sampleRate / 2) {
+        m_s24PackMode = S24PackMode::LsbAligned;  // Safe default
+        DEBUG_LOG("[S24] Timeout after 500ms silence, defaulting to LSB");
+    }
+}
+```
+
+**Caller:** `DirettaSync::open()` calls `m_ringBuffer.setSampleRate(format.sampleRate)`.
+
+### 3. Member Location Correction
+
+**Issue:** Design said "add m_bypassMode to AudioEngine.h" but it belongs on `AudioDecoder`.
+
+**Confirmed location:** `AudioDecoder` class (src/AudioEngine.h:66) - this is where the design's code snippets already place it.
+
+### 4. Adaptive Chunk Size Wiring
+
+**Issue:** `audioThreadFunc()` in DirettaRenderer uses fixed sizes (src/DirettaRenderer.cpp:533, 578). The adaptive sizing method needs to be called there.
+
+**Solution:** Wire adaptive sizing in `DirettaRenderer`, not `AudioEngine`:
+
+```cpp
+// In DirettaRenderer.cpp audioThreadFunc()
+// Replace fixed size:
+size_t samplesNeeded = 4096;  // OLD
+
+// With adaptive sizing:
+float bufferLevel = m_direttaSync->getBufferLevel();
+size_t samplesNeeded = calculateAdaptiveChunkSize(4096, bufferLevel);
+```
+
+**Alternative:** Move `getAdaptiveChunkSize()` to `DirettaRenderer` instead of `AudioEngine`, since `DirettaRenderer` owns the `DirettaSync` instance and can directly query buffer level.
+
+### 5. Existing Code Touchpoints Summary
+
+| Location | Change |
+|----------|--------|
+| src/AudioEngine.cpp:236 | Insert `request_sample_fmt` + capability check BEFORE `avcodec_open2()` |
+| src/AudioEngine.cpp:710 | Add `m_resamplerInitialized` flag check |
+| src/AudioEngine.cpp:930 | Reuse existing direct-copy path for bypass |
+| src/AudioEngine.cpp:1027 | Replace fixed 8192 FIFO with dynamic sizing |
+| src/DirettaRingBuffer.h:625 | Extend S24 detection with hint + deferred mode |
+| src/DirettaRenderer.cpp:533,578 | Wire adaptive chunk sizing |
