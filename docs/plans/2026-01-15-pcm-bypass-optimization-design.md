@@ -100,18 +100,15 @@ This is integrated with optimization #1 above.
 
 **Problem:** Current `detectS24PackMode()` checks first 32 samples for zero bytes. Silence or fade-ins cause mis-detection.
 
-**Solution:** Hybrid approach with FFmpeg metadata hint and deferred detection.
+**Solution:** Hybrid approach where sample-based detection takes priority, with FFmpeg hint as fallback only when detection is inconclusive.
+
+**CRITICAL:** The hint is NON-AUTHORITATIVE. `bits_per_coded_sample` only indicates container size, not byte alignment. MSB-aligned 24-in-32 sources (left-justified PCM) would be mispacked if we trusted the hint blindly.
 
 ```cpp
 enum class S24PackMode { Unknown, LsbAligned, MsbAligned, Deferred };
 
 S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) {
-    // Phase 1: Check FFmpeg metadata hint
-    if (m_s24MetadataHint != S24PackMode::Unknown) {
-        return m_s24MetadataHint;
-    }
-
-    // Phase 2: Scan for non-zero samples
+    // Phase 1: ALWAYS try sample-based detection first (authoritative)
     size_t checkSamples = std::min<size_t>(numSamples, 64);
     bool hasNonZeroLsb = false;
     bool hasNonZeroMsb = false;
@@ -127,12 +124,25 @@ S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) {
             allZero = false;
     }
 
-    // Phase 3: Decision
-    if (allZero) return S24PackMode::Deferred;  // Wait for real audio
+    // Phase 2: If samples are conclusive, use them (ignore hint)
     if (hasNonZeroLsb) return S24PackMode::LsbAligned;
-    return S24PackMode::MsbAligned;
+    if (!allZero) return S24PackMode::MsbAligned;  // Has non-zero but not in LSB position
+
+    // Phase 3: Samples inconclusive (all zero) - use hint as fallback
+    if (m_s24MetadataHint != S24PackMode::Unknown) {
+        DEBUG_LOG("[S24] All-zero samples, using metadata hint");
+        return m_s24MetadataHint;
+    }
+
+    // Phase 4: No hint available - defer decision
+    return S24PackMode::Deferred;
 }
 ```
+
+**Priority order:**
+1. Sample-based detection (authoritative) - if non-zero samples exist, they determine alignment
+2. FFmpeg metadata hint (fallback) - only used when all samples are zero
+3. Deferred (last resort) - wait for non-zero audio data
 
 **Deferred handling:** Buffer data and re-check on next call. Use LSB-aligned as safe default after 500ms timeout.
 
@@ -179,17 +189,18 @@ struct TrackInfo {
 };
 ```
 
-2. In `AudioDecoder::open()`, detect alignment from FFmpeg:
+2. In `AudioDecoder::open()`, detect alignment hint from FFmpeg:
 ```cpp
-// Detect 24-bit alignment from codec parameters
+// Provide alignment HINT from codec parameters (non-authoritative!)
+// NOTE: bits_per_coded_sample only indicates container size, NOT byte alignment
+// This hint is ONLY used when sample-based detection sees all-zero data
 if (m_trackInfo.bitDepth == 24) {
-    // FFmpeg's bits_per_coded_sample vs bits_per_raw_sample indicates alignment
-    // If bits_per_coded_sample == 32 and bits_per_raw_sample == 24: LSB-aligned (common)
-    // If bits_per_coded_sample == 24: tightly packed, assume LSB
     if (codecpar->bits_per_coded_sample == 32) {
+        // Most 24-in-32 is LSB-aligned, but MSB-aligned exists (left-justified)
+        // Mark as hint, sample detection will override if it sees non-zero data
         m_trackInfo.s24Alignment = TrackInfo::S24Alignment::LsbAligned;
     }
-    // Some DACs/formats use MSB alignment - detect from codec ID if known
+    // Note: This is a HINT only - sample-based detection takes priority
 }
 ```
 
@@ -367,6 +378,7 @@ if (m_bypassMode) {
 | Deferred detection never resolves | Timeout with LSB default after 500ms |
 | Adaptive sizing causes underrun | Deadband prevents over-correction, MIN_SCALE = 0.25 |
 | S24 hint propagation breaks | Graceful fallback to sample detection if hint is Unknown |
+| S24 hint incorrect (MSB source) | Sample-based detection takes priority; hint only used for all-zero data |
 | Gapless S24 mode mismatch | `setS24PackHint()` resets `m_s24PackMode` on track change |
 
 ## Testing
@@ -381,3 +393,4 @@ if (m_bypassMode) {
 8. Test decoder that only supports planar - verify no EINVAL from `avcodec_open2()`
 9. Test 384kHz playback - verify FIFO size is 32768 (not collapsed to 4096)
 10. Test gapless transition between tracks with different S24 alignment
+11. Test MSB-aligned 24-bit source - verify sample detection overrides LSB hint
