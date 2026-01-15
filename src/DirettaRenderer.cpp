@@ -7,6 +7,7 @@
 
 #include "DirettaRenderer.h"
 #include "DirettaSync.h"
+#include "DirettaRingBuffer.h"
 #include "UPnPDevice.hpp"
 #include "AudioEngine.h"
 #include <chrono>
@@ -16,6 +17,7 @@
 #include <functional>
 #include <unistd.h>
 #include <cstring>
+#include <algorithm>
 
 extern bool g_verbose;
 #define DEBUG_LOG(x) if (g_verbose) { std::cout << x << std::endl; }
@@ -230,6 +232,15 @@ bool DirettaRenderer::start() {
                     if (!m_direttaSync->open(format)) {
                         std::cerr << "[Callback] Failed to open DirettaSync" << std::endl;
                         return false;
+                    }
+
+                    // Propagate S24 alignment hint AFTER open() completes
+                    if (trackInfo.s24Alignment == TrackInfo::S24Alignment::LsbAligned) {
+                        m_direttaSync->setS24PackModeHint(DirettaRingBuffer::S24PackMode::LsbAligned);
+                        DEBUG_LOG("[Callback] S24 hint propagated: LsbAligned");
+                    } else if (trackInfo.s24Alignment == TrackInfo::S24Alignment::MsbAligned) {
+                        m_direttaSync->setS24PackModeHint(DirettaRingBuffer::S24PackMode::MsbAligned);
+                        DEBUG_LOG("[Callback] S24 hint propagated: MsbAligned");
                     }
                 }
 
@@ -522,6 +533,28 @@ void DirettaRenderer::upnpThreadFunc() {
     DEBUG_LOG("[UPnP Thread] Stopped");
 }
 
+size_t DirettaRenderer::calculateAdaptiveChunkSize(size_t baseSize, float bufferLevel) const {
+    constexpr float TARGET_LEVEL = 0.50f;
+    constexpr float DEADBAND = 0.10f;
+    constexpr float MIN_SCALE = 0.25f;
+    constexpr float MAX_SCALE = 1.50f;
+
+    float scale = 1.0f;
+    float deviation = bufferLevel - TARGET_LEVEL;
+
+    if (deviation > DEADBAND) {
+        // Buffer too full - reduce chunk size
+        scale = 1.0f - ((deviation - DEADBAND) / (1.0f - TARGET_LEVEL - DEADBAND));
+        scale = std::max(scale, MIN_SCALE);
+    } else if (deviation < -DEADBAND) {
+        // Buffer too empty - increase chunk size
+        scale = 1.0f + ((-deviation - DEADBAND) / (TARGET_LEVEL - DEADBAND)) * 0.5f;
+        scale = std::min(scale, MAX_SCALE);
+    }
+
+    return static_cast<size_t>(baseSize * scale);
+}
+
 void DirettaRenderer::audioThreadFunc() {
     DEBUG_LOG("[Audio Thread] Started");
 
@@ -551,15 +584,7 @@ void DirettaRenderer::audioThreadFunc() {
             }
 
             // Adjust samples per call based on format
-            size_t samplesPerCall = isDSD ? 32768 : 8192;
-
-            if (sampleRate != lastSampleRate || samplesPerCall != currentSamplesPerCall) {
-                currentSamplesPerCall = samplesPerCall;
-                lastSampleRate = sampleRate;
-                DEBUG_LOG("[Audio Thread] Format: " << sampleRate << "Hz "
-                          << (isDSD ? "DSD" : "PCM") << ", samples/call="
-                          << currentSamplesPerCall);
-            }
+            size_t baseSamplesPerCall = isDSD ? 32768 : 8192;
 
             // Buffer-level flow control (MPD-style)
             // Only throttle if DirettaSync is actively playing
@@ -568,6 +593,17 @@ void DirettaRenderer::audioThreadFunc() {
             float bufferLevel = 0.0f;
             if (m_direttaSync && m_direttaSync->isPlaying()) {
                 bufferLevel = m_direttaSync->getBufferLevel();
+            }
+
+            // Apply adaptive sizing based on buffer level
+            size_t samplesPerCall = calculateAdaptiveChunkSize(baseSamplesPerCall, bufferLevel);
+
+            if (sampleRate != lastSampleRate || samplesPerCall != currentSamplesPerCall) {
+                currentSamplesPerCall = samplesPerCall;
+                lastSampleRate = sampleRate;
+                DEBUG_LOG("[Audio Thread] Format: " << sampleRate << "Hz "
+                          << (isDSD ? "DSD" : "PCM") << ", samples/call="
+                          << currentSamplesPerCall);
             }
 
             if (bufferLevel > BUFFER_HIGH_THRESHOLD) {

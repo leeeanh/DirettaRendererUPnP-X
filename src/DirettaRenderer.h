@@ -81,4 +81,10 @@ private:
 
     // DAC stabilization timing
     std::chrono::steady_clock::time_point m_lastStopTime;
+
+    // Adaptive chunk sizing based on buffer level
+    size_t calculateAdaptiveChunkSize(size_t baseSize, float bufferLevel) const;
+
+    // Track URI for gapless S24 hint updates
+    std::string m_lastProcessedURI;
 };

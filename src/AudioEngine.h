@@ -35,9 +35,15 @@ struct TrackInfo {
     enum class DSDSourceFormat { Unknown, DSF, DFF };
     DSDSourceFormat dsdSourceFormat;
 
+    // 24-bit alignment hint from FFmpeg (for S24_P32 packing)
+    // This is a HINT only - sample-based detection takes priority
+    enum class S24Alignment { Unknown, LsbAligned, MsbAligned };
+    S24Alignment s24Alignment = S24Alignment::Unknown;
+
     TrackInfo() : sampleRate(0), bitDepth(0), channels(2), duration(0),
                   isDSD(false), dsdRate(0), isCompressed(true),
-                  dsdSourceFormat(DSDSourceFormat::Unknown) {}
+                  dsdSourceFormat(DSDSourceFormat::Unknown),
+                  s24Alignment(S24Alignment::Unknown) {}
 };
 
 /**
@@ -147,7 +153,12 @@ private:
     int m_packetCount = 0;                // DSD packet counter
     bool m_resamplerInitLogged = false;   // Resampler init logged (open())
 
+    // PCM bypass mode - skip resampler when formats match exactly
+    bool m_bypassMode = false;
+    bool m_resamplerInitialized = false;
+
     bool initResampler(uint32_t outputRate, uint32_t outputBits);
+    bool canBypass(uint32_t outputRate, uint32_t outputBits) const;
 };
 
 /**

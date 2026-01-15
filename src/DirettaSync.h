@@ -224,6 +224,13 @@ public:
     float getBufferLevel() const;
     const AudioFormat& getFormat() const { return m_currentFormat; }
 
+    /**
+     * @brief Set S24 pack mode hint from TrackInfo
+     */
+    void setS24PackModeHint(DirettaRingBuffer::S24PackMode hint) {
+        m_ringBuffer.setS24PackModeHint(hint);
+    }
+
     //=========================================================================
     // Target Management
     //=========================================================================

@@ -104,7 +104,7 @@ public:
         silenceByte_.store(silenceByte, std::memory_order_release);
         clear();
         fillWithSilence();
-        m_s24PackMode = S24PackMode::Unknown;
+        // clear() already resets S24 state - hint will be set by caller via setS24PackModeHint()
     }
 
     size_t size() const { return size_; }
@@ -131,7 +131,12 @@ public:
     void clear() {
         writePos_.store(0, std::memory_order_release);
         readPos_.store(0, std::memory_order_release);
+        // Reset all S24 state to allow fresh detection for new tracks
+        // New track will set hint via setS24PackModeHint() if available
         m_s24PackMode = S24PackMode::Unknown;
+        m_s24Hint = S24PackMode::Unknown;
+        m_s24DetectionConfirmed = false;
+        m_deferredSampleCount = 0;
     }
 
     void fillWithSilence() {
@@ -186,11 +191,36 @@ public:
 
         prefetch_audio_buffer(data, numSamples * 4);
 
-        if (m_s24PackMode == S24PackMode::Unknown) {
-            m_s24PackMode = detectS24PackMode(data, numSamples);
+        // Hybrid S24 detection - sample detection can override hints
+        // Always run detection when Unknown/Deferred, or when hint was applied but not confirmed
+        if (m_s24PackMode == S24PackMode::Unknown || m_s24PackMode == S24PackMode::Deferred ||
+            (m_s24PackMode == m_s24Hint && !m_s24DetectionConfirmed)) {
+            S24PackMode detected = detectS24PackMode(data, numSamples);
+            if (detected != S24PackMode::Deferred) {
+                // Sample detection found definitive result - override any hint
+                if (detected != m_s24Hint && m_s24Hint != S24PackMode::Unknown) {
+                    // Log when detection disagrees with hint (important for debugging)
+                }
+                m_s24PackMode = detected;
+                m_s24DetectionConfirmed = true;
+                m_deferredSampleCount = 0;
+            } else {
+                m_deferredSampleCount += numSamples;
+                // Timeout: if still silent after ~1 second, use hint or default to LSB
+                if (m_deferredSampleCount > DEFERRED_TIMEOUT_SAMPLES) {
+                    m_s24PackMode = (m_s24Hint != S24PackMode::Unknown) ? m_s24Hint : S24PackMode::LsbAligned;
+                    m_s24DetectionConfirmed = true;
+                }
+            }
         }
 
-        size_t stagedBytes = (m_s24PackMode == S24PackMode::MsbAligned)
+        // Use effective mode for conversion (Deferred uses hint or LSB as default)
+        S24PackMode effectiveMode = m_s24PackMode;
+        if (effectiveMode == S24PackMode::Deferred || effectiveMode == S24PackMode::Unknown) {
+            effectiveMode = (m_s24Hint != S24PackMode::Unknown) ? m_s24Hint : S24PackMode::LsbAligned;
+        }
+
+        size_t stagedBytes = (effectiveMode == S24PackMode::MsbAligned)
             ? convert24BitPackedShifted_AVX2(m_staging24BitPack, data, numSamples)
             : convert24BitPacked_AVX2(m_staging24BitPack, data, numSamples);
         size_t written = writeToRing(m_staging24BitPack, stagedBytes);
@@ -622,17 +652,53 @@ private:
     alignas(64) std::atomic<size_t> readPos_{0};
     std::atomic<uint8_t> silenceByte_{0};
 
-    enum class S24PackMode { Unknown, LsbAligned, MsbAligned };
-    S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) const {
-        size_t checkSamples = std::min<size_t>(numSamples, 32);
-        for (size_t i = 0; i < checkSamples; i++) {
-            if (data[i * 4] != 0x00) {
-                return S24PackMode::LsbAligned;
-            }
+public:
+    enum class S24PackMode { Unknown, LsbAligned, MsbAligned, Deferred };
+
+    void setS24PackModeHint(S24PackMode hint) {
+        // Store hint separately - sample detection can override
+        m_s24Hint = hint;
+        // Reset confirmation so detection runs again with new hint
+        m_s24DetectionConfirmed = false;
+        // Apply hint immediately only if no mode detected yet
+        if (m_s24PackMode == S24PackMode::Unknown || m_s24PackMode == S24PackMode::Deferred) {
+            m_s24PackMode = hint;
         }
-        return S24PackMode::MsbAligned;
     }
+
+    S24PackMode getS24PackMode() const { return m_s24PackMode; }
+    S24PackMode getS24Hint() const { return m_s24Hint; }
+
+private:
+    S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) {
+        size_t checkSamples = std::min<size_t>(numSamples, 32);
+        bool allZeroLSB = true;
+        bool allZeroMSB = true;
+
+        for (size_t i = 0; i < checkSamples; i++) {
+            uint8_t b0 = data[i * 4];       // LSB position
+            uint8_t b3 = data[i * 4 + 3];   // MSB position
+            if (b0 != 0x00) allZeroLSB = false;
+            if (b3 != 0x00) allZeroMSB = false;
+        }
+
+        if (!allZeroLSB && allZeroMSB) {
+            return S24PackMode::LsbAligned;
+        } else if (allZeroLSB && !allZeroMSB) {
+            return S24PackMode::MsbAligned;
+        } else if (allZeroLSB && allZeroMSB) {
+            // Silence - can't determine, use deferred
+            return S24PackMode::Deferred;
+        }
+        // Both non-zero - ambiguous, default to LSB
+        return S24PackMode::LsbAligned;
+    }
+
     S24PackMode m_s24PackMode = S24PackMode::Unknown;
+    S24PackMode m_s24Hint = S24PackMode::Unknown;
+    bool m_s24DetectionConfirmed = false;
+    size_t m_deferredSampleCount = 0;
+    static constexpr size_t DEFERRED_TIMEOUT_SAMPLES = 48000;
 };
 
 #endif // DIRETTA_RING_BUFFER_H
