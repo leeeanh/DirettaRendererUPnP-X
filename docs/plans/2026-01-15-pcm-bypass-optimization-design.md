@@ -33,8 +33,23 @@ else if (srcFmt == AV_SAMPLE_FMT_S32P)
     preferredFormat = AV_SAMPLE_FMT_S32;
 // NOTE: Do NOT request FLT for FLTP - float bypass would corrupt audio
 
-if (preferredFormat != AV_SAMPLE_FMT_NONE) {
-    m_codecContext->request_sample_fmt = preferredFormat;
+// CRITICAL: Check if decoder actually supports packed format before requesting
+// Some decoders only support planar output - requesting unsupported format
+// causes avcodec_open2() to fail with EINVAL
+if (preferredFormat != AV_SAMPLE_FMT_NONE && codec->sample_fmts != nullptr) {
+    bool packedSupported = false;
+    for (const AVSampleFormat* fmt = codec->sample_fmts; *fmt != AV_SAMPLE_FMT_NONE; fmt++) {
+        if (*fmt == preferredFormat) {
+            packedSupported = true;
+            break;
+        }
+    }
+    if (packedSupported) {
+        m_codecContext->request_sample_fmt = preferredFormat;
+        DEBUG_LOG("[AudioDecoder] Requesting packed format: " << av_get_sample_fmt_name(preferredFormat));
+    } else {
+        DEBUG_LOG("[AudioDecoder] Packed format not supported by decoder, will use swr");
+    }
 }
 
 // NOW open the codec
@@ -42,6 +57,8 @@ if (avcodec_open2(m_codecContext, codec, nullptr) < 0) {
     // error handling...
 }
 ```
+
+**Why capability check is required:** FFmpeg treats `request_sample_fmt` as a hard requirement for many decoders. If a decoder only advertises planar output in `codec->sample_fmts`, requesting packed format causes `avcodec_open2()` to fail with `EINVAL`, breaking playback entirely.
 
 In `AudioDecoder::initResampler()`:
 
@@ -121,7 +138,19 @@ S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) {
 
 **New members in DirettaRingBuffer:**
 - `S24PackMode m_s24MetadataHint = S24PackMode::Unknown;`
-- `void setS24PackHint(S24PackMode hint) { m_s24MetadataHint = hint; }`
+- Setter that ALSO resets detection state:
+
+```cpp
+void setS24PackHint(S24PackMode hint) {
+    m_s24MetadataHint = hint;
+    // CRITICAL: Reset pack mode to force re-detection on next push
+    // Without this, gapless transitions retain the previous track's
+    // pack mode even when alignment differs, corrupting audio
+    m_s24PackMode = S24PackMode::Unknown;
+}
+```
+
+**Why reset is required:** On gapless transitions where the ring buffer isn't resized (same sample rate/bit depth), `push24BitPacked()` only calls `detectS24PackMode()` when `m_s24PackMode == Unknown`. Without resetting, the previous track's pack mode stays latched and the new hint is ignored, potentially packing the next track with wrong byte ordering.
 
 **API propagation path for metadata hint:**
 
@@ -227,16 +256,22 @@ size_t AudioEngine::getAdaptiveChunkSize(size_t maxSamples) const {
 **Solution:** Scale FIFO size based on output rate.
 
 ```cpp
-constexpr int BASE_RATE = 44100;
-constexpr int BASE_FRAME_SIZE = 4096;
+constexpr int64_t BASE_RATE = 44100;
+constexpr int64_t BASE_FRAME_SIZE = 4096;
 constexpr int MIN_FIFO_SAMPLES = 4096;
 constexpr int MAX_FIFO_SAMPLES = 32768;
 
-int fifoSamples = (2 * outputRate * BASE_FRAME_SIZE) / BASE_RATE;
-fifoSamples = std::clamp(fifoSamples, MIN_FIFO_SAMPLES, MAX_FIFO_SAMPLES);
+// CRITICAL: Use 64-bit arithmetic to avoid overflow at high sample rates
+// At 384kHz: 2 * 384000 * 4096 = 3,145,728,000 which exceeds INT_MAX (2,147,483,647)
+int64_t fifoSamples64 = (2 * static_cast<int64_t>(outputRate) * BASE_FRAME_SIZE) / BASE_RATE;
+int fifoSamples = static_cast<int>(std::clamp(fifoSamples64,
+                                               static_cast<int64_t>(MIN_FIFO_SAMPLES),
+                                               static_cast<int64_t>(MAX_FIFO_SAMPLES)));
 
 m_pcmFifo = av_audio_fifo_alloc(outFormat, m_trackInfo.channels, fifoSamples);
 ```
+
+**Why 64-bit arithmetic:** At 384kHz, the intermediate product `2 * 384000 * 4096 = 3,145,728,000` exceeds `INT_MAX` (2,147,483,647). Without 64-bit arithmetic, the value wraps negative and `std::clamp` produces `MIN_FIFO_SAMPLES`, dramatically undersizing the FIFO and causing underruns.
 
 **Resulting sizes:**
 
@@ -307,6 +342,7 @@ if (m_bypassMode) {
 | Scenario | Behavior |
 |----------|----------|
 | Decoder ignores packed request | `canBypass()` returns false, uses swr |
+| Decoder only supports planar | Capability check skips request, `avcodec_open2()` succeeds, uses swr |
 | Decoder outputs float (FLT/FLTP) | Bypass explicitly disabled, swr converts to S32 |
 | AAC/Vorbis/MP3 streams | Always use swr (these output float), no bypass |
 | FLAC/ALAC/WAV streams | May bypass if decoder outputs S16/S32 and rate matches |
@@ -315,6 +351,8 @@ if (m_bypassMode) {
 | 24-bit silence at start | Deferred detection, LSB default after 500ms timeout |
 | Buffer callback not set | `getAdaptiveChunkSize()` returns `maxSamples` unchanged |
 | S24 hint not propagated | Falls back to sample-based detection (existing behavior) |
+| Gapless 24-bit transition | `setS24PackHint()` resets `m_s24PackMode` to force re-detection |
+| 384kHz high-rate PCM | 64-bit FIFO arithmetic prevents overflow, correct sizing |
 
 ## Risk Assessment
 
@@ -322,11 +360,14 @@ if (m_bypassMode) {
 |------|------------|
 | Bypass incorrectly enabled | Conservative `canBypass()` requires integer format (S16/S32), matching rate, and matching layout |
 | Float bypass corruption | Float formats explicitly excluded from bypass check |
+| request_sample_fmt breaks codec | Capability check via `codec->sample_fmts` before requesting |
 | request_sample_fmt ignored | Check actual format after `avcodec_open2()`, not requested format |
+| FIFO overflow at high rates | 64-bit arithmetic prevents `INT_MAX` wraparound |
 | FIFO too small at edge rates | Clamped to safe minimum 4096 samples |
 | Deferred detection never resolves | Timeout with LSB default after 500ms |
 | Adaptive sizing causes underrun | Deadband prevents over-correction, MIN_SCALE = 0.25 |
 | S24 hint propagation breaks | Graceful fallback to sample detection if hint is Unknown |
+| Gapless S24 mode mismatch | `setS24PackHint()` resets `m_s24PackMode` on track change |
 
 ## Testing
 
@@ -337,3 +378,6 @@ if (m_bypassMode) {
 5. Monitor buffer levels during playback to verify adaptive sizing
 6. Test S24 hint propagation by checking logs for "hint: LsbAligned" on 24-bit FLAC
 7. Verify `request_sample_fmt` is set BEFORE `avcodec_open2()` in debug logs
+8. Test decoder that only supports planar - verify no EINVAL from `avcodec_open2()`
+9. Test 384kHz playback - verify FIFO size is 32768 (not collapsed to 4096)
+10. Test gapless transition between tracks with different S24 alignment
