@@ -869,6 +869,12 @@ bool DirettaSync::startPlayback() {
 void DirettaSync::stopPlayback(bool immediate) {
     if (!m_playing) return;
 
+    // Report accumulated underruns (moved from hot path)
+    uint32_t underruns = m_underrunCount.exchange(0, std::memory_order_relaxed);
+    if (underruns > 0) {
+        std::cerr << "[DirettaSync] Session had " << underruns << " underrun(s)" << std::endl;
+    }
+
     if (!immediate) {
         requestShutdownSilence(m_isDsdMode.load(std::memory_order_acquire) ? 50 : 20);
 
@@ -1097,8 +1103,7 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
 
     // Underrun
     if (avail < static_cast<size_t>(currentBytesPerBuffer)) {
-        std::cerr << "[DirettaSync] UNDERRUN #" << count
-                  << " avail=" << avail << " need=" << currentBytesPerBuffer << std::endl;
+        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
         m_workerActive = false;
         return true;

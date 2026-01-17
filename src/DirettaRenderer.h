@@ -74,10 +74,9 @@ private:
     std::string m_currentURI;
     std::string m_currentMetadata;
 
-    // Callback synchronization
-    mutable std::mutex m_callbackMutex;
-    std::condition_variable m_callbackCV;
-    bool m_callbackRunning{false};
+    // Callback synchronization (lock-free for hot path)
+    std::atomic<bool> m_callbackRunning{false};
+    std::atomic<bool> m_shutdownRequested{false};
 
     // DAC stabilization timing
     std::chrono::steady_clock::time_point m_lastStopTime;

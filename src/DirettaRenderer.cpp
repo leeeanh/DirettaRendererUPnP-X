@@ -90,13 +90,22 @@ DirettaRenderer::~DirettaRenderer() {
 }
 
 void DirettaRenderer::waitForCallbackComplete() {
-    std::unique_lock<std::mutex> lk(m_callbackMutex);
-    bool completed = m_callbackCV.wait_for(lk, std::chrono::seconds(5),
-        [this]{ return !m_callbackRunning; });
-    if (!completed) {
-        std::cerr << "[DirettaRenderer] CRITICAL: Callback timeout!" << std::endl;
-        m_callbackRunning = false;
+    // Use seq_cst to pair with callback's seq_cst operations
+    m_shutdownRequested.store(true, std::memory_order_seq_cst);
+
+    auto start = std::chrono::steady_clock::now();
+    while (m_callbackRunning.load(std::memory_order_seq_cst)) {
+        std::this_thread::yield();
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        if (elapsed > std::chrono::seconds(5)) {
+            std::cerr << "[DirettaRenderer] CRITICAL: Callback timeout!" << std::endl;
+            // Reset flag to avoid permanent "callback running" state
+            m_callbackRunning.store(false, std::memory_order_release);
+            break;
+        }
     }
+
+    m_shutdownRequested.store(false, std::memory_order_release);
 }
 
 //=============================================================================
@@ -154,21 +163,20 @@ bool DirettaRenderer::start() {
             [this](const AudioBuffer& buffer, size_t samples,
                    uint32_t sampleRate, uint32_t bitDepth, uint32_t channels) -> bool {
 
-                // RAII guard
-                {
-                    std::lock_guard<std::mutex> lk(m_callbackMutex);
-                    m_callbackRunning = true;
+                // CRITICAL: Set running flag FIRST, then check shutdown.
+                // This order prevents a race where stopper checks m_callbackRunning
+                // before we set it, but after checking m_shutdownRequested.
+                m_callbackRunning.store(true, std::memory_order_seq_cst);
+
+                if (m_shutdownRequested.load(std::memory_order_seq_cst)) {
+                    m_callbackRunning.store(false, std::memory_order_release);
+                    return false;
                 }
+
                 struct Guard {
-                    DirettaRenderer* self;
-                    ~Guard() {
-                        {
-                            std::lock_guard<std::mutex> lk(self->m_callbackMutex);
-                            self->m_callbackRunning = false;
-                        }
-                        self->m_callbackCV.notify_all();
-                    }
-                } guard{this};
+                    std::atomic<bool>& flag;
+                    ~Guard() { flag.store(false, std::memory_order_release); }
+                } guard{m_callbackRunning};
 
                 const TrackInfo& trackInfo = m_audioEngine->getCurrentTrackInfo();
 
@@ -359,10 +367,7 @@ bool DirettaRenderer::start() {
 
                 std::cout << "[DirettaRenderer] Auto-STOP before URI change" << std::endl;
 
-                {
-                    std::lock_guard<std::mutex> cbLock(m_callbackMutex);
-                    m_audioEngine->stop();
-                }
+                m_audioEngine->stop();
                 waitForCallbackComplete();
 
                 // Don't close DirettaSync - keep connection alive for quick track transitions
@@ -438,10 +443,7 @@ bool DirettaRenderer::start() {
 
             m_lastStopTime = std::chrono::steady_clock::now();
 
-            {
-                std::lock_guard<std::mutex> cbLock(m_callbackMutex);
-                m_audioEngine->stop();
-            }
+            m_audioEngine->stop();
             waitForCallbackComplete();
 
             if (!m_currentURI.empty()) {

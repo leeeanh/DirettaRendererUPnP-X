@@ -320,6 +320,7 @@ private:
     std::mutex m_configMutex;
     std::atomic<bool> m_reconfiguring{false};
     mutable std::atomic<int> m_ringUsers{0};
+    std::atomic<uint32_t> m_underrunCount{0};
 
     // Ring buffer
     DirettaRingBuffer m_ringBuffer;

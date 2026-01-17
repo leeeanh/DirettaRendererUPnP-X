@@ -551,22 +551,16 @@ private:
         uint8_t* ring = buffer_.data();
         size_t firstChunk = std::min(len, size - writePos);
 
-        if (firstChunk >= 32) {
+        if (firstChunk > 0) {
             memcpy_audio_fixed(ring + writePos, staged, firstChunk);
-        } else if (firstChunk > 0) {
-            std::memcpy(ring + writePos, staged, firstChunk);
         }
 
         size_t secondChunk = len - firstChunk;
         if (secondChunk > 0) {
-            if (secondChunk >= 32) {
-                memcpy_audio_fixed(ring, staged + firstChunk, secondChunk);
-            } else {
-                std::memcpy(ring, staged + firstChunk, secondChunk);
-            }
+            memcpy_audio_fixed(ring, staged + firstChunk, secondChunk);
         }
 
-        size_t newWritePos = (writePos + len) % size;
+        size_t newWritePos = (writePos + len) & mask_;
         writePos_.store(newWritePos, std::memory_order_release);
 
         return len;
