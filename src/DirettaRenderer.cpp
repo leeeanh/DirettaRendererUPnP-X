@@ -323,6 +323,13 @@ bool DirettaRenderer::start() {
 
         m_audioEngine->setTrackEndCallback([this]() {
             std::cout << "[DirettaRenderer] 🏁 Track ended naturally" << std::endl;
+
+            // Stop Diretta playback to prevent underrun log spam
+            // This sets m_stopRequested which outputs silence instead of logging underruns
+            if (m_direttaSync) {
+                m_direttaSync->stopPlayback(true);
+            }
+
             // Notify control point that track finished
             // This is required for sequential playlist advancement
             // The control point will poll GetTransportInfo, see STOPPED,
