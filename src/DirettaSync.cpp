@@ -18,9 +18,12 @@ public:
         if (reconfiguring.load(std::memory_order_acquire)) {
             return;
         }
-        users_.fetch_add(1, std::memory_order_acq_rel);
+        // MUST use acquire: ensures increment visible to beginReconfigure()
+        // before any ring buffer operations
+        users_.fetch_add(1, std::memory_order_acquire);
         if (reconfiguring.load(std::memory_order_acquire)) {
-            users_.fetch_sub(1, std::memory_order_acq_rel);
+            // Bail-out: never entered guarded section, relaxed is safe
+            users_.fetch_sub(1, std::memory_order_relaxed);
             return;
         }
         active_ = true;
@@ -28,7 +31,8 @@ public:
 
     ~RingAccessGuard() {
         if (active_) {
-            users_.fetch_sub(1, std::memory_order_acq_rel);
+            // Release: ensures all ring ops complete before decrement
+            users_.fetch_sub(1, std::memory_order_release);
         }
     }
 
@@ -812,6 +816,10 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
     DIRETTA_LOG("Ring PCM: " << rate << "Hz " << channels << "ch "
                 << direttaBps << "bps, buffer=" << ringSize
                 << ", prefill=" << m_prefillTarget);
+
+    // Increment format generation to invalidate cached values
+    m_formatGeneration.fetch_add(1, std::memory_order_release);
+    m_consumerStateGen.fetch_add(1, std::memory_order_release);
 }
 
 void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
@@ -845,6 +853,10 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
 
     DIRETTA_LOG("Ring DSD: byteRate=" << byteRate << " ch=" << channels
                 << " buffer=" << ringSize << " prefill=" << m_prefillTarget);
+
+    // Increment format generation to invalidate cached values
+    m_formatGeneration.fetch_add(1, std::memory_order_release);
+    m_consumerStateGen.fetch_add(1, std::memory_order_release);
 }
 
 //=============================================================================
@@ -938,14 +950,28 @@ size_t DirettaSync::sendAudio(const uint8_t* data, size_t numSamples) {
     RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
     if (!ringGuard.active()) return 0;
 
-    // Snapshot config state
-    bool dsdMode = m_isDsdMode.load(std::memory_order_acquire);
-    bool pack24bit = m_need24BitPack.load(std::memory_order_acquire);
-    bool upsample16to32 = m_need16To32Upsample.load(std::memory_order_acquire);
-    bool needBitReversal = m_needDsdBitReversal.load(std::memory_order_acquire);
-    bool needByteSwap = m_needDsdByteSwap.load(std::memory_order_acquire);
-    int numChannels = m_channels.load(std::memory_order_acquire);
-    int bytesPerSample = m_bytesPerSample.load(std::memory_order_acquire);
+    // Generation counter optimization: single atomic load in common case
+    uint32_t gen = m_formatGeneration.load(std::memory_order_acquire);
+    if (gen != m_cachedFormatGen) {
+        // Cold path: reload all format values (only on format change)
+        m_cachedDsdMode = m_isDsdMode.load(std::memory_order_acquire);
+        m_cachedPack24bit = m_need24BitPack.load(std::memory_order_acquire);
+        m_cachedUpsample16to32 = m_need16To32Upsample.load(std::memory_order_acquire);
+        m_cachedNeedBitReversal = m_needDsdBitReversal.load(std::memory_order_acquire);
+        m_cachedNeedByteSwap = m_needDsdByteSwap.load(std::memory_order_acquire);
+        m_cachedChannels = m_channels.load(std::memory_order_acquire);
+        m_cachedBytesPerSample = m_bytesPerSample.load(std::memory_order_acquire);
+        m_cachedFormatGen = gen;
+    }
+
+    // Hot path: use cached values
+    bool dsdMode = m_cachedDsdMode;
+    bool pack24bit = m_cachedPack24bit;
+    bool upsample16to32 = m_cachedUpsample16to32;
+    bool needBitReversal = m_cachedNeedBitReversal;
+    bool needByteSwap = m_cachedNeedByteSwap;
+    int numChannels = m_cachedChannels;
+    int bytesPerSample = m_cachedBytesPerSample;
 
     size_t written = 0;
     size_t totalBytes;
@@ -1025,10 +1051,23 @@ float DirettaSync::getBufferLevel() const {
 bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
     m_workerActive = true;
 
-    int currentBytesPerBuffer = m_bytesPerBuffer.load(std::memory_order_acquire);
-    uint32_t remainder = m_framesPerBufferRemainder.load(std::memory_order_acquire);
+    // Generation counter optimization: single atomic load in common case
+    uint32_t gen = m_consumerStateGen.load(std::memory_order_acquire);
+    if (gen != m_cachedConsumerGen) {
+        // Cold path: reload stable configuration (only on format change)
+        m_cachedBytesPerBuffer = m_bytesPerBuffer.load(std::memory_order_acquire);
+        m_cachedFramesRemainder = m_framesPerBufferRemainder.load(std::memory_order_acquire);
+        m_cachedBytesPerFrame = m_bytesPerFrame.load(std::memory_order_acquire);
+        m_cachedConsumerIsDsd = m_isDsdMode.load(std::memory_order_acquire);
+        m_cachedSilenceByte = m_ringBuffer.silenceByte();
+        m_cachedConsumerGen = gen;
+    }
+
+    // Hot path: use cached values
+    int currentBytesPerBuffer = m_cachedBytesPerBuffer;
+    uint32_t remainder = m_cachedFramesRemainder;
     if (remainder != 0) {
-        int bytesPerFrame = m_bytesPerFrame.load(std::memory_order_acquire);
+        int bytesPerFrame = m_cachedBytesPerFrame;
         uint32_t acc = m_framesPerBufferAccumulator.load(std::memory_order_relaxed);
         acc += remainder;
         if (acc >= 1000) {
@@ -1037,7 +1076,7 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
         }
         m_framesPerBufferAccumulator.store(acc, std::memory_order_relaxed);
     }
-    uint8_t currentSilenceByte = m_ringBuffer.silenceByte();
+    uint8_t currentSilenceByte = m_cachedSilenceByte;
 
     if (stream.size() != static_cast<size_t>(currentBytesPerBuffer)) {
         stream.resize(currentBytesPerBuffer);
@@ -1052,7 +1091,7 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
         return true;
     }
 
-    bool currentIsDsd = m_isDsdMode.load(std::memory_order_acquire);
+    bool currentIsDsd = m_cachedConsumerIsDsd;
     size_t currentRingSize = m_ringBuffer.size();
 
     // Shutdown silence

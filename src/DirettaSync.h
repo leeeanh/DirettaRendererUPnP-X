@@ -322,6 +322,30 @@ private:
     mutable std::atomic<int> m_ringUsers{0};
     std::atomic<uint32_t> m_underrunCount{0};
 
+    // Format generation counter - incremented on ANY format change
+    std::atomic<uint32_t> m_formatGeneration{0};
+
+    // Cached format values for sendAudio fast path (producer thread only)
+    uint32_t m_cachedFormatGen{0};
+    bool m_cachedDsdMode{false};
+    bool m_cachedPack24bit{false};
+    bool m_cachedUpsample16to32{false};
+    bool m_cachedNeedBitReversal{false};
+    bool m_cachedNeedByteSwap{false};
+    int m_cachedChannels{2};
+    int m_cachedBytesPerSample{2};
+
+    // Consumer state generation - incremented on config changes
+    std::atomic<uint32_t> m_consumerStateGen{0};
+
+    // Cached consumer state for getNewStream fast path (worker thread only)
+    uint32_t m_cachedConsumerGen{0};
+    int m_cachedBytesPerBuffer{176};
+    uint32_t m_cachedFramesRemainder{0};
+    int m_cachedBytesPerFrame{0};
+    bool m_cachedConsumerIsDsd{false};
+    uint8_t m_cachedSilenceByte{0};
+
     // Ring buffer
     DirettaRingBuffer m_ringBuffer;
 

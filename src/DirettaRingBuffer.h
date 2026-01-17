@@ -148,6 +148,45 @@ public:
     const uint8_t* getStagingDSD() const { return m_stagingDSD; }
 
     //=========================================================================
+    // Direct Write API (zero-copy fast path)
+    //=========================================================================
+
+    /**
+     * @brief Get direct write pointer for zero-copy writes
+     * @param needed Minimum bytes needed
+     * @param region Output: pointer to contiguous write region
+     * @param available Output: bytes available in region
+     * @return true if contiguous space >= needed is available
+     */
+    bool getDirectWriteRegion(size_t needed, uint8_t*& region, size_t& available) {
+        if (size_ == 0) return false;
+
+        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t rp = readPos_.load(std::memory_order_acquire);
+
+        // Contiguous space from writePos to either readPos or end of buffer
+        size_t toEnd = size_ - wp;
+        size_t totalFree = (rp - wp - 1) & mask_;
+        size_t contiguous = std::min(toEnd, totalFree);
+
+        if (contiguous >= needed) {
+            region = buffer_.data() + wp;
+            available = contiguous;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Commit a direct write, advancing write pointer
+     * @param written Number of bytes written to the region
+     */
+    void commitDirectWrite(size_t written) {
+        size_t wp = writePos_.load(std::memory_order_relaxed);
+        writePos_.store((wp + written) & mask_, std::memory_order_release);
+    }
+
+    //=========================================================================
     // Push methods (write to buffer)
     //=========================================================================
 
@@ -155,14 +194,26 @@ public:
      * @brief Push PCM data directly (no conversion)
      */
     size_t push(const uint8_t* data, size_t len) {
+        // Fast path: try direct write (no wraparound)
+        uint8_t* region;
+        size_t available;
+        if (getDirectWriteRegion(len, region, available)) {
+            memcpy_audio(region, data, len);
+            commitDirectWrite(len);
+            return len;
+        }
+
+        // Slow path: handle wraparound with inlined position loads
         if (size_ == 0) return 0;
-        size_t free = getFreeSpace();
+
+        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t rp = readPos_.load(std::memory_order_acquire);
+        size_t free = (rp - wp - 1) & mask_;
+
         if (len > free) len = free;
         if (len == 0) return 0;
 
-        size_t wp = writePos_.load(std::memory_order_acquire);
         size_t firstChunk = std::min(len, size_ - wp);
-
         memcpy_audio(buffer_.data() + wp, data, firstChunk);
         if (firstChunk < len) {
             memcpy_audio(buffer_.data(), data + firstChunk, len - firstChunk);
@@ -508,11 +559,16 @@ public:
      */
     size_t pop(uint8_t* dest, size_t len) {
         if (size_ == 0) return 0;
-        size_t avail = getAvailable();
+
+        // Inline position loads to avoid redundant atomic reads
+        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t rp = readPos_.load(std::memory_order_acquire);
+        size_t avail = (wp - rp) & mask_;
+
         if (len > avail) len = avail;
         if (len == 0) return 0;
 
-        size_t rp = readPos_.load(std::memory_order_acquire);
+        // rp already loaded, reuse directly
         size_t firstChunk = std::min(len, size_ - rp);
 
         memcpy_audio(dest, buffer_.data() + rp, firstChunk);
