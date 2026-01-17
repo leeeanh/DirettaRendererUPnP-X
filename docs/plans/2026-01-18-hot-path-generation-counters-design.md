@@ -278,7 +278,7 @@ if (m_silenceBuffersRemaining.load(std::memory_order_acquire) > 0) { ... }
 
 ---
 
-## C2: Relaxed Ordering in RingAccessGuard
+## C2: Lighter Ordering in RingAccessGuard
 
 ### Problem
 
@@ -291,7 +291,13 @@ users_.fetch_sub(1, std::memory_order_acq_rel);  // destructor
 
 ### Solution
 
-Use relaxed ordering where safe. The guard coordinates with `beginReconfigure()` which does its own acquire fence.
+Use minimal ordering that preserves correctness:
+
+- **Increment must stay acquire** (or acq_rel): Ensures the increment is visible to `beginReconfigure()` before any ring buffer operations. Without this, `beginReconfigure()` could see `m_ringUsers == 0` and proceed to resize/clear the buffer while a thread is already inside the guarded section.
+
+- **Decrement can use release**: The release ensures all ring buffer operations complete before the count decrements, which is sufficient for `beginReconfigure()` to safely proceed after seeing zero.
+
+- **Bail-out decrement can use relaxed**: If we fail the second reconfiguring check, we never entered the guarded section, so no ordering is needed.
 
 **Updated RingAccessGuard:**
 
@@ -303,9 +309,9 @@ public:
         if (reconfiguring.load(std::memory_order_acquire)) {
             return;
         }
-        users_.fetch_add(1, std::memory_order_relaxed);  // was acq_rel
+        users_.fetch_add(1, std::memory_order_acquire);  // MUST stay acquire
         if (reconfiguring.load(std::memory_order_acquire)) {
-            users_.fetch_sub(1, std::memory_order_relaxed);  // was acq_rel
+            users_.fetch_sub(1, std::memory_order_relaxed);  // bail-out, no ordering needed
             return;
         }
         active_ = true;
@@ -325,6 +331,8 @@ private:
 };
 ```
 
+**Net savings:** Decrement goes from acq_rel to release (lighter on some architectures), bail-out decrement uses relaxed. Increment stays acquire for correctness.
+
 ---
 
 ## Files Modified
@@ -332,7 +340,7 @@ private:
 | File | Changes |
 |------|---------|
 | `src/DirettaSync.h` | Add generation counters and cached value members |
-| `src/DirettaSync.cpp` | Generation checks in sendAudio/getNewStream, increments in configure functions, relaxed guard |
+| `src/DirettaSync.cpp` | Generation checks in sendAudio/getNewStream, increments in configure functions, lighter guard ordering |
 | `src/DirettaRingBuffer.h` | Add getDirectWriteRegion/commitDirectWrite, inline position loads in push/pop |
 
 ---
