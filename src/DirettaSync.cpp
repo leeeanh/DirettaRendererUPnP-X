@@ -632,6 +632,9 @@ void DirettaSync::fullReset() {
         m_isLowBitrate.store(false, std::memory_order_release);
         m_need24BitPack.store(false, std::memory_order_release);
         m_need16To32Upsample.store(false, std::memory_order_release);
+        m_bytesPerFrame.store(0, std::memory_order_release);
+        m_framesPerBufferRemainder.store(0, std::memory_order_release);
+        m_framesPerBufferAccumulator.store(0, std::memory_order_release);
 
         m_ringBuffer.clear();
     }
@@ -793,7 +796,13 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
     m_ringBuffer.resize(ringSize, 0x00);
     ringSize = m_ringBuffer.size();
 
-    m_bytesPerBuffer.store(((rate + 999) / 1000) * channels * direttaBps, std::memory_order_release);
+    int bytesPerFrame = channels * direttaBps;
+    int framesBase = rate / 1000;
+    int framesRemainder = rate % 1000;
+    m_bytesPerFrame.store(bytesPerFrame, std::memory_order_release);
+    m_framesPerBufferRemainder.store(static_cast<uint32_t>(framesRemainder), std::memory_order_release);
+    m_framesPerBufferAccumulator.store(0, std::memory_order_release);
+    m_bytesPerBuffer.store(framesBase * bytesPerFrame, std::memory_order_release);
 
     m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, false,
         m_isLowBitrate.load(std::memory_order_acquire));
@@ -826,6 +835,9 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     bytesPerBuffer = ((bytesPerBuffer + (4 * channels - 1)) / (4 * channels)) * (4 * channels);
     if (bytesPerBuffer < 64) bytesPerBuffer = 64;
     m_bytesPerBuffer.store(static_cast<int>(bytesPerBuffer), std::memory_order_release);
+    m_bytesPerFrame.store(0, std::memory_order_release);
+    m_framesPerBufferRemainder.store(0, std::memory_order_release);
+    m_framesPerBufferAccumulator.store(0, std::memory_order_release);
 
     m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, true, false);
     m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
@@ -1008,6 +1020,17 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
     m_workerActive = true;
 
     int currentBytesPerBuffer = m_bytesPerBuffer.load(std::memory_order_acquire);
+    uint32_t remainder = m_framesPerBufferRemainder.load(std::memory_order_acquire);
+    if (remainder != 0) {
+        int bytesPerFrame = m_bytesPerFrame.load(std::memory_order_acquire);
+        uint32_t acc = m_framesPerBufferAccumulator.load(std::memory_order_relaxed);
+        acc += remainder;
+        if (acc >= 1000) {
+            acc -= 1000;
+            currentBytesPerBuffer += bytesPerFrame;
+        }
+        m_framesPerBufferAccumulator.store(acc, std::memory_order_relaxed);
+    }
     uint8_t currentSilenceByte = m_ringBuffer.silenceByte();
 
     if (stream.size() != static_cast<size_t>(currentBytesPerBuffer)) {

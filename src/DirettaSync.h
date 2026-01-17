@@ -330,6 +330,9 @@ private:
     std::atomic<int> m_bytesPerSample{2};
     std::atomic<int> m_inputBytesPerSample{2};
     std::atomic<int> m_bytesPerBuffer{176};
+    std::atomic<int> m_bytesPerFrame{0};
+    std::atomic<uint32_t> m_framesPerBufferRemainder{0};
+    std::atomic<uint32_t> m_framesPerBufferAccumulator{0};
     std::atomic<bool> m_need24BitPack{false};
     std::atomic<bool> m_need16To32Upsample{false};
     std::atomic<bool> m_isDsdMode{false};
