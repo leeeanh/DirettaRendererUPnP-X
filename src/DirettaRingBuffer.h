@@ -583,6 +583,50 @@ public:
     uint8_t* data() { return buffer_.data(); }
     const uint8_t* data() const { return buffer_.data(); }
 
+    //=========================================================================
+    // Direct Read API (zero-copy consumer fast path)
+    //=========================================================================
+
+    /**
+     * @brief Get direct read pointer for zero-copy consumer access
+     *
+     * Returns a pointer to contiguous data in the ring buffer that the
+     * consumer can read directly without copying. This is the consumer-side
+     * equivalent of getDirectWriteRegion().
+     *
+     * Thread safety: Safe to call from consumer thread while producer pushes.
+     * The returned pointer remains valid until advanceReadPos() is called.
+     *
+     * @param needed Minimum bytes required
+     * @param region Output: pointer to contiguous read region
+     * @param available Output: total contiguous bytes available (may exceed needed)
+     * @return true if contiguous data >= needed is available, false if data wraps
+     */
+    bool getDirectReadRegion(size_t needed, const uint8_t*& region, size_t& available) const {
+        if (size_ == 0) return false;
+
+        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t rp = readPos_.load(std::memory_order_acquire);
+        size_t totalAvail = (wp - rp) & mask_;
+
+        // Not enough data at all
+        if (totalAvail < needed) return false;
+
+        // Calculate contiguous region from read position
+        // Either to write position (if no wrap) or to end of buffer
+        size_t toEnd = size_ - rp;
+        size_t contiguous = std::min(toEnd, totalAvail);
+
+        if (contiguous >= needed) {
+            region = buffer_.data() + rp;
+            available = contiguous;
+            return true;
+        }
+
+        // Data wraps around - caller must use pop() instead
+        return false;
+    }
+
 private:
     /**
      * Write staged data to ring buffer with efficient wraparound handling
