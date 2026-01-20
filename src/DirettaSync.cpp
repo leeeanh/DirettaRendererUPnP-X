@@ -1088,9 +1088,19 @@ void DirettaSync::resumePlayback() {
     m_stopRequested = false;
     m_silenceBuffersRemaining = 0;
 
+    // SDK 148: Wait for buffer release before clearing buffer data
+    blockZeroCopyAndWait(std::chrono::milliseconds(100));
+
     // Clear stale buffer data and require fresh prefill
     m_ringBuffer.clear();
     m_prefillComplete = false;
+
+    // Reset zero-copy state
+    m_zeroCopyInUse.store(false, std::memory_order_release);
+    m_outputBufferInUse.store(false, std::memory_order_release);
+    m_pendingZeroCopyAdvance.store(false, std::memory_order_release);
+    m_pendingAdvanceBytes.store(0, std::memory_order_release);
+    m_zeroCopyBlocked.store(false, std::memory_order_release);
 
     play();
     m_paused = false;
