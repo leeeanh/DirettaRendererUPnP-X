@@ -299,6 +299,30 @@ private:
         DirettaSync& sync_;
     };
 
+    /**
+     * @brief RAII guard to mark worker thread as active
+     *
+     * Sets m_workerActive flag on construction and clears on destruction.
+     * Used to signal that the getNewStream() worker is currently executing.
+     */
+    class WorkerActiveGuard {
+    public:
+        explicit WorkerActiveGuard(std::atomic<bool>& workerActive)
+            : workerActive_(workerActive) {
+            workerActive_.store(true, std::memory_order_release);
+        }
+
+        ~WorkerActiveGuard() {
+            workerActive_.store(false, std::memory_order_release);
+        }
+
+        WorkerActiveGuard(const WorkerActiveGuard&) = delete;
+        WorkerActiveGuard& operator=(const WorkerActiveGuard&) = delete;
+
+    private:
+        std::atomic<bool>& workerActive_;
+    };
+
     //=========================================================================
     // State
     //=========================================================================
