@@ -1071,6 +1071,10 @@ void DirettaSync::pausePlayback() {
     }
 
     stop();
+
+    // SDK 148: Wait for buffer release before changing pause state
+    blockZeroCopyAndWait(std::chrono::milliseconds(100));
+
     m_paused = true;
 }
 
