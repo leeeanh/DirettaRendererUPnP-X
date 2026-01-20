@@ -74,6 +74,11 @@ static const uint8_t bitReverseTable[256] = {
 DirettaSync::DirettaSync() {
     m_ringBuffer.resize(44100 * 2 * 4, 0x00);
 
+    // Pre-allocate reconfigure silence buffer (SDK 148)
+    // Used to safely flush pipeline during format transitions
+    // Size: typical max bytes per Diretta stream (will be resized in open)
+    m_reconfigureSilenceBuffer.resize(16384, 0x00);
+
     // Initialize zero-copy state
     m_zeroCopyInUse.store(false, std::memory_order_release);
     m_outputBufferInUse.store(false, std::memory_order_release);

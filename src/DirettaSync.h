@@ -386,6 +386,10 @@ private:
     // Ring buffer
     DirettaRingBuffer m_ringBuffer;
 
+    // Dedicated silence buffer for format reconfiguration (SDK 148)
+    // Used to safely flush pipeline during format transitions
+    std::vector<uint8_t> m_reconfigureSilenceBuffer;
+
     // Format parameters (atomic snapshot for audio thread)
     std::atomic<int> m_sampleRate{44100};
     std::atomic<int> m_channels{2};
