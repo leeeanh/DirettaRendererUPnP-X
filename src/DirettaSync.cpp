@@ -73,11 +73,26 @@ static const uint8_t bitReverseTable[256] = {
 
 DirettaSync::DirettaSync() {
     m_ringBuffer.resize(44100 * 2 * 4, 0x00);
+
+    // Initialize zero-copy state
+    m_zeroCopyInUse.store(false, std::memory_order_release);
+    m_outputBufferInUse.store(false, std::memory_order_release);
+    m_pendingZeroCopyAdvance.store(false, std::memory_order_release);
+    m_pendingAdvanceBytes.store(0, std::memory_order_release);
+    m_zeroCopyBlocked.store(false, std::memory_order_release);
+
     DIRETTA_LOG("Created");
 }
 
 DirettaSync::~DirettaSync() {
     disable();
+
+    // Ensure SDK has released all buffer pointers before destruction
+    if (m_zeroCopyInUse.load(std::memory_order_acquire) ||
+        m_outputBufferInUse.load(std::memory_order_acquire)) {
+        blockZeroCopyAndWait(std::chrono::seconds(5));
+    }
+
     DIRETTA_LOG("Destroyed");
 }
 
