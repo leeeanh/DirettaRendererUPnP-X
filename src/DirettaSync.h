@@ -284,6 +284,7 @@ private:
     void requestShutdownSilence(int buffers);
     bool waitForOnline(unsigned int timeoutMs);
     void logSinkCapabilities();
+    void sendReconfigureSilence(int buffers);
 
     // Zero-copy helpers (SDK 148 migration)
     ZeroCopyWaitResult blockZeroCopyAndWait(std::chrono::milliseconds timeout);

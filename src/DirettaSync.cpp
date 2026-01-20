@@ -1342,6 +1342,39 @@ void DirettaSync::requestShutdownSilence(int buffers) {
     DIRETTA_LOG("Requested " << buffers << " shutdown silence buffers");
 }
 
+void DirettaSync::sendReconfigureSilence(int buffers) {
+    /**
+     * Send silence via dedicated buffer during format reconfiguration (SDK 148)
+     *
+     * Unlike requestShutdownSilence which uses getNewStream internal state,
+     * this directly injects silence into the ring buffer to safely flush
+     * the Diretta pipeline during format transitions.
+     *
+     * This prevents ring buffer stalls and ensures clean format switches.
+     */
+
+    if (buffers <= 0) return;
+
+    uint8_t silenceByte = m_ringBuffer.silenceByte();
+    size_t bytesPerBuffer = m_bytesPerBuffer.load(std::memory_order_acquire);
+
+    // Ensure reconfigure silence buffer is large enough
+    if (m_reconfigureSilenceBuffer.size() < bytesPerBuffer) {
+        m_reconfigureSilenceBuffer.resize(bytesPerBuffer, silenceByte);
+    } else {
+        std::fill(m_reconfigureSilenceBuffer.begin(),
+                  m_reconfigureSilenceBuffer.begin() + bytesPerBuffer,
+                  silenceByte);
+    }
+
+    // Push silence buffers
+    for (int i = 0; i < buffers; i++) {
+        m_ringBuffer.push(m_reconfigureSilenceBuffer.data(), bytesPerBuffer);
+    }
+
+    DIRETTA_LOG("Sent " << buffers << " reconfigure silence buffers (" << (buffers * bytesPerBuffer) << " bytes)");
+}
+
 bool DirettaSync::waitForOnline(unsigned int timeoutMs) {
     auto start = std::chrono::steady_clock::now();
     auto timeout = std::chrono::milliseconds(timeoutMs);
