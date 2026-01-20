@@ -441,8 +441,22 @@ bool DirettaSync::open(const AudioFormat& format) {
                 }
             }
 
+            // SDK 148: Block zero-copy and wait for buffer release before ring clear
+            auto result = blockZeroCopyAndWait(std::chrono::milliseconds(200));
+            if (result == ZeroCopyWaitResult::Released) {
+                m_pendingZeroCopyAdvance = false;
+                m_pendingAdvanceBytes = 0;
+                m_zeroCopyInUse = false;
+                m_outputBufferInUse = false;
+                m_ringBuffer.clear();
+                m_zeroCopyBlocked = false;
+            } else {
+                // Fall back to full open without reusing buffers
+                std::cout << "[DirettaSync] Buffer release timeout, falling back to full open" << std::endl;
+                goto full_open;
+            }
+
             // Clear buffer and reset flags
-            m_ringBuffer.clear();
             m_prefillComplete = false;
             m_postOnlineDelayDone = false;
             m_stabilizationCount = 0;
@@ -466,6 +480,7 @@ bool DirettaSync::open(const AudioFormat& format) {
         }
     }
 
+full_open:
     // Full reset for first open or after format change reopen
     if (needFullConnect) {
         fullReset();
