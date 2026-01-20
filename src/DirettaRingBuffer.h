@@ -627,6 +627,22 @@ public:
         return false;
     }
 
+    /**
+     * @brief Advance read position after zero-copy read
+     *
+     * Called after client has read from the pointer returned by
+     * getDirectReadRegion(). Updates the ring buffer's internal read
+     * position to mark those bytes as consumed.
+     *
+     * Thread safety: Safe to call from consumer thread.
+     *
+     * @param bytes Number of bytes to advance read position
+     */
+    void advanceReadPos(size_t bytes) {
+        size_t rp = readPos_.load(std::memory_order_acquire);
+        readPos_.store((rp + bytes) & mask_, std::memory_order_release);
+    }
+
 private:
     /**
      * Write staged data to ring buffer with efficient wraparound handling

@@ -69,11 +69,58 @@ void test_getDirectReadRegion_wraparound_returns_false() {
     std::cout << "test_getDirectReadRegion_wraparound_returns_false PASSED" << std::endl;
 }
 
+void test_advanceReadPos_basic() {
+    DirettaRingBuffer ring;
+    ring.resize(1024, 0x00);
+
+    uint8_t input[100];
+    for (int i = 0; i < 100; i++) input[i] = static_cast<uint8_t>(i);
+    ring.push(input, 100);
+
+    assert(ring.getAvailable() == 100);
+
+    // Get region but don't pop
+    const uint8_t* region;
+    size_t available;
+    ring.getDirectReadRegion(50, region, available);
+
+    // Manually advance read position
+    ring.advanceReadPos(50);
+
+    assert(ring.getAvailable() == 50 && "Should have 50 bytes left after advance");
+
+    // Verify remaining data is correct
+    uint8_t output[50];
+    ring.pop(output, 50);
+    assert(output[0] == 50 && "First remaining byte should be 50");
+
+    std::cout << "test_advanceReadPos_basic PASSED" << std::endl;
+}
+
+void test_advanceReadPos_full_consume() {
+    DirettaRingBuffer ring;
+    ring.resize(256, 0x00);
+
+    uint8_t input[64];
+    ring.push(input, 64);
+
+    const uint8_t* region;
+    size_t available;
+    ring.getDirectReadRegion(64, region, available);
+    ring.advanceReadPos(64);
+
+    assert(ring.getAvailable() == 0 && "Buffer should be empty");
+
+    std::cout << "test_advanceReadPos_full_consume PASSED" << std::endl;
+}
+
 int main() {
     test_getDirectReadRegion_basic();
     test_getDirectReadRegion_insufficient_data();
     test_getDirectReadRegion_wraparound_returns_false();
+    test_advanceReadPos_basic();
+    test_advanceReadPos_full_consume();
 
-    std::cout << "\nAll getDirectReadRegion tests PASSED!" << std::endl;
+    std::cout << "\nAll direct read tests PASSED!" << std::endl;
     return 0;
 }
