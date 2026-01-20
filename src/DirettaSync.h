@@ -136,6 +136,16 @@ private:
 enum class DirettaTransferMode { FIX_AUTO, VAR_AUTO, VAR_MAX, AUTO };
 
 //=============================================================================
+// Zero-Copy Helper
+//=============================================================================
+
+enum class ZeroCopyWaitResult {
+    Released,      // SDK released all buffer references
+    Timeout,       // Wait timed out
+    Error          // Error occurred
+};
+
+//=============================================================================
 // Configuration
 //=============================================================================
 
@@ -275,6 +285,9 @@ private:
     bool waitForOnline(unsigned int timeoutMs);
     void logSinkCapabilities();
 
+    // Zero-copy helpers (SDK 148 migration)
+    ZeroCopyWaitResult blockZeroCopyAndWait(std::chrono::milliseconds timeout);
+
     class ReconfigureGuard {
     public:
         explicit ReconfigureGuard(DirettaSync& sync) : sync_(sync) { sync_.beginReconfigure(); }
@@ -375,6 +388,19 @@ private:
     // Statistics
     std::atomic<int> m_streamCount{0};
     std::atomic<int> m_pushCount{0};
+
+    // SDK 148 zero-copy members
+    DIRETTA::Stream m_currentStream;  // Current stream for zero-copy reads
+
+    // Zero-copy state tracking
+    std::atomic<bool> m_zeroCopyInUse{false};      // Stream buffer currently held by SDK
+    std::atomic<bool> m_outputBufferInUse{false};  // Output buffer pointer held by SDK
+    std::atomic<bool> m_pendingZeroCopyAdvance{false};  // Advance pending after SDK releases
+    std::atomic<size_t> m_pendingAdvanceBytes{0}; // Bytes to advance when SDK releases
+    std::atomic<bool> m_zeroCopyBlocked{false};    // Force fallback to copying
+
+    // Pre-allocated fallback buffer for wraparound cases
+    std::vector<uint8_t> m_fallbackBuffer;
 };
 
 #endif // DIRETTA_SYNC_H
