@@ -1161,7 +1161,18 @@ float DirettaSync::getBufferLevel() const {
 //=============================================================================
 
 bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
-    m_workerActive = true;
+    /**
+     * SDK 148 Migration: Hybrid Zero-Copy Implementation
+     *
+     * Strategy:
+     * 1. Mark worker as active (WorkerActiveGuard)
+     * 2. Use copyWithFallback() for hybrid zero-copy read
+     * 3. Store deferred read position advance info
+     * 4. SDK reads directly from buffer when contiguous
+     * 5. Read position advanced later when SDK releases
+     */
+
+    WorkerActiveGuard activeGuard(m_workerActive);
 
     // Generation counter optimization: single atomic load in common case
     uint32_t gen = m_consumerStateGen.load(std::memory_order_acquire);
@@ -1199,7 +1210,6 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
     RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
     if (!ringGuard.active()) {
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
-        m_workerActive = false;
         return true;
     }
 
@@ -1211,21 +1221,18 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
     if (silenceRemaining > 0) {
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
         m_silenceBuffersRemaining.fetch_sub(1, std::memory_order_acq_rel);
-        m_workerActive = false;
         return true;
     }
 
     // Stop requested
     if (m_stopRequested.load(std::memory_order_acquire)) {
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
-        m_workerActive = false;
         return true;
     }
 
     // Prefill not complete
     if (!m_prefillComplete.load(std::memory_order_acquire)) {
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
-        m_workerActive = false;
         return true;
     }
 
@@ -1238,7 +1245,6 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
             DIRETTA_LOG("Post-online stabilization complete");
         }
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
-        m_workerActive = false;
         return true;
     }
 
@@ -1256,14 +1262,18 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
     if (avail < static_cast<size_t>(currentBytesPerBuffer)) {
         m_underrunCount.fetch_add(1, std::memory_order_relaxed);
         std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
-        m_workerActive = false;
         return true;
     }
 
-    // Pop from ring buffer
-    m_ringBuffer.pop(dest, currentBytesPerBuffer);
+    // SDK 148: Use hybrid zero-copy with fallback (critical path)
+    size_t copied = copyWithFallback(dest, currentBytesPerBuffer);
+    m_pushCount.fetch_add(1, std::memory_order_relaxed);
 
-    m_workerActive = false;
+    if (g_verbose && copied < static_cast<size_t>(currentBytesPerBuffer)) {
+        DIRETTA_LOG("WARNING: copyWithFallback underread: requested="
+                    << currentBytesPerBuffer << " got=" << copied);
+    }
+
     return true;
 }
 
