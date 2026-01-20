@@ -148,6 +148,33 @@ void DirettaSync::disable() {
     DIRETTA_LOG("Disabled");
 }
 
+//=============================================================================
+// Zero-Copy Buffer Management
+//=============================================================================
+
+ZeroCopyWaitResult DirettaSync::blockZeroCopyAndWait(std::chrono::milliseconds timeout) {
+    // Block new zero-copy attempts
+    m_zeroCopyBlocked.store(true, std::memory_order_release);
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Wait for SDK to release buffer pointers
+    while (m_zeroCopyInUse.load(std::memory_order_acquire) ||
+           m_outputBufferInUse.load(std::memory_order_acquire)) {
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        if (elapsed >= timeout) {
+            std::cout << "[DirettaSync] blockZeroCopyAndWait TIMEOUT after " << elapsed.count() << "ms" << std::endl;
+            return ZeroCopyWaitResult::Timeout;
+        }
+
+        std::this_thread::yield();
+    }
+
+    // Successfully released
+    std::cout << "[DirettaSync] blockZeroCopyAndWait RELEASED" << std::endl;
+    return ZeroCopyWaitResult::Released;
+}
+
 bool DirettaSync::openSyncConnection() {
     ACQUA::Clock cycleTime = ACQUA::Clock::MicroSeconds(m_config.cycleTime);
 
