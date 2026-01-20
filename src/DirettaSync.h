@@ -11,6 +11,10 @@
 
 #include "DirettaRingBuffer.h"
 
+extern "C" {
+    #include "diretta_stream.h"
+}
+
 #include <Sync.hpp>
 #include <Find.hpp>
 #include <Stream.hpp>
@@ -245,7 +249,7 @@ protected:
     // DIRETTA::Sync Overrides
     //=========================================================================
 
-    bool getNewStream(DIRETTA::Stream& stream) override;
+    bool getNewStream(diretta_stream& stream) override;
     bool getNewStreamCmp() override { return true; }
     bool startSyncWorker() override;
     void statusUpdate() override {}
@@ -266,8 +270,10 @@ private:
     void configureSinkDSD(uint32_t dsdBitRate, int channels, const AudioFormat& format);
     void configureRingPCM(int rate, int channels, int direttaBps, int inputBps);
     void configureRingDSD(uint32_t byteRate, int channels);
-    void beginReconfigure();
+    bool beginReconfigure();
     void endReconfigure();
+    bool waitForPendingRelease(std::chrono::milliseconds timeout);
+    void fillSilence(diretta_stream& stream, size_t bytes, uint8_t silenceByte);
 
     void applyTransferMode(DirettaTransferMode mode, ACQUA::Clock cycleTime);
     unsigned int calculateCycleTime(uint32_t sampleRate, int channels, int bitsPerSample);
@@ -277,13 +283,15 @@ private:
 
     class ReconfigureGuard {
     public:
-        explicit ReconfigureGuard(DirettaSync& sync) : sync_(sync) { sync_.beginReconfigure(); }
-        ~ReconfigureGuard() { sync_.endReconfigure(); }
+        explicit ReconfigureGuard(DirettaSync& sync) : sync_(sync), active_(sync_.beginReconfigure()) {}
+        ~ReconfigureGuard() { if (active_) sync_.endReconfigure(); }
         ReconfigureGuard(const ReconfigureGuard&) = delete;
         ReconfigureGuard& operator=(const ReconfigureGuard&) = delete;
+        bool active() const { return active_; }
 
     private:
         DirettaSync& sync_;
+        bool active_;
     };
 
     //=========================================================================
@@ -321,6 +329,12 @@ private:
     std::atomic<bool> m_reconfiguring{false};
     mutable std::atomic<int> m_ringUsers{0};
     std::atomic<uint32_t> m_underrunCount{0};
+
+    // SDK 148 zero-copy state
+    std::atomic<size_t> m_pendingAdvance{0};  // Deferred read position advance
+
+    // Silence buffer - pre-allocated on format change
+    alignas(64) std::vector<uint8_t> m_silenceBuffer;
 
     // Format generation counter - incremented on ANY format change
     std::atomic<uint32_t> m_formatGeneration{0};

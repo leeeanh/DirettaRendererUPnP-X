@@ -352,7 +352,10 @@ bool DirettaSync::open(const AudioFormat& format) {
             }
 
             // Clear buffer and reset flags
-            m_ringBuffer.clear();
+            // Wait for SDK to release buffer before clear
+            if (waitForPendingRelease(std::chrono::milliseconds(100))) {
+                m_ringBuffer.clear();
+            }
             m_prefillComplete = false;
             m_postOnlineDelayDone = false;
             m_stabilizationCount = 0;
@@ -640,7 +643,10 @@ void DirettaSync::fullReset() {
         m_framesPerBufferRemainder.store(0, std::memory_order_release);
         m_framesPerBufferAccumulator.store(0, std::memory_order_release);
 
-        m_ringBuffer.clear();
+        // Wait for SDK to release buffer before clear
+        if (waitForPendingRelease(std::chrono::milliseconds(100))) {
+            m_ringBuffer.clear();
+        }
     }
 
     m_stopRequested = false;
@@ -782,6 +788,10 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
 void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int inputBps) {
     std::lock_guard<std::mutex> lock(m_configMutex);
     ReconfigureGuard guard(*this);
+    if (!guard.active()) {
+        DIRETTA_LOG("configureRingPCM aborted - SDK still holds buffer");
+        return;
+    }
 
     m_sampleRate.store(rate, std::memory_order_release);
     m_channels.store(channels, std::memory_order_release);
@@ -813,6 +823,12 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
     m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
     m_prefillComplete = false;
 
+    // Pre-allocate silence buffer for max possible bytes per callback
+    size_t maxSilenceBytes = static_cast<size_t>((framesBase + 1) * bytesPerFrame);
+    if (m_silenceBuffer.size() < maxSilenceBytes) {
+        m_silenceBuffer.resize(maxSilenceBytes);
+    }
+
     DIRETTA_LOG("Ring PCM: " << rate << "Hz " << channels << "ch "
                 << direttaBps << "bps, buffer=" << ringSize
                 << ", prefill=" << m_prefillTarget);
@@ -825,6 +841,10 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
 void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     std::lock_guard<std::mutex> lock(m_configMutex);
     ReconfigureGuard guard(*this);
+    if (!guard.active()) {
+        DIRETTA_LOG("configureRingDSD aborted - SDK still holds buffer");
+        return;
+    }
 
     m_isDsdMode.store(true, std::memory_order_release);
     m_need24BitPack.store(false, std::memory_order_release);
@@ -850,6 +870,12 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, true, false);
     m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
     m_prefillComplete = false;
+
+    // Pre-allocate silence buffer for DSD
+    size_t maxSilenceBytes = static_cast<size_t>(bytesPerBuffer) + 64;
+    if (m_silenceBuffer.size() < maxSilenceBytes) {
+        m_silenceBuffer.resize(maxSilenceBytes);
+    }
 
     DIRETTA_LOG("Ring DSD: byteRate=" << byteRate << " ch=" << channels
                 << " buffer=" << ringSize << " prefill=" << m_prefillTarget);
@@ -898,6 +924,12 @@ void DirettaSync::stopPlayback(bool immediate) {
     }
 
     stop();
+
+    // Wait for SDK to release buffer before any potential clear
+    if (waitForPendingRelease(std::chrono::milliseconds(100))) {
+        m_ringBuffer.clear();
+    }
+
     m_playing = false;
     m_paused = false;
 }
@@ -928,7 +960,10 @@ void DirettaSync::resumePlayback() {
     m_silenceBuffersRemaining = 0;
 
     // Clear stale buffer data and require fresh prefill
-    m_ringBuffer.clear();
+    // Wait for SDK to release buffer before clear
+    if (waitForPendingRelease(std::chrono::milliseconds(100))) {
+        m_ringBuffer.clear();
+    }
     m_prefillComplete = false;
 
     play();
@@ -1044,12 +1079,26 @@ float DirettaSync::getBufferLevel() const {
     return static_cast<float>(m_ringBuffer.getAvailable()) / static_cast<float>(size);
 }
 
+void DirettaSync::fillSilence(diretta_stream& stream, size_t bytes, uint8_t silenceByte) {
+    // m_silenceBuffer pre-allocated on format change, always large enough
+    std::memset(m_silenceBuffer.data(), silenceByte, bytes);
+    stream.Data.P = m_silenceBuffer.data();
+    stream.Size = static_cast<unsigned long long>(bytes);
+}
+
 //=============================================================================
 // DIRETTA::Sync Overrides
 //=============================================================================
 
-bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
+bool DirettaSync::getNewStream(diretta_stream& stream) {
     m_workerActive = true;
+
+    // Complete previous deferred advance (atomic load)
+    size_t pending = m_pendingAdvance.load(std::memory_order_acquire);
+    if (pending > 0) {
+        m_ringBuffer.advanceReadPos(pending);
+        m_pendingAdvance.store(0, std::memory_order_release);
+    }
 
     // Generation counter optimization: single atomic load in common case
     uint32_t gen = m_consumerStateGen.load(std::memory_order_acquire);
@@ -1078,26 +1127,17 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
     }
     uint8_t currentSilenceByte = m_cachedSilenceByte;
 
-    if (stream.size() != static_cast<size_t>(currentBytesPerBuffer)) {
-        stream.resize(currentBytesPerBuffer);
-    }
-
-    uint8_t* dest = reinterpret_cast<uint8_t*>(stream.get_16());
-
     RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
     if (!ringGuard.active()) {
-        std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
+        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
     }
 
-    bool currentIsDsd = m_cachedConsumerIsDsd;
-    size_t currentRingSize = m_ringBuffer.size();
-
     // Shutdown silence
     int silenceRemaining = m_silenceBuffersRemaining.load(std::memory_order_acquire);
     if (silenceRemaining > 0) {
-        std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
+        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_silenceBuffersRemaining.fetch_sub(1, std::memory_order_acq_rel);
         m_workerActive = false;
         return true;
@@ -1105,14 +1145,14 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
 
     // Stop requested
     if (m_stopRequested.load(std::memory_order_acquire)) {
-        std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
+        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
     }
 
     // Prefill not complete
     if (!m_prefillComplete.load(std::memory_order_acquire)) {
-        std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
+        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
     }
@@ -1125,31 +1165,46 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
             m_stabilizationCount = 0;
             DIRETTA_LOG("Post-online stabilization complete");
         }
-        std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
+        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
     }
 
     int count = m_streamCount.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Check available data first (distinguishes underrun vs wrap)
     size_t avail = m_ringBuffer.getAvailable();
+    if (avail < static_cast<size_t>(currentBytesPerBuffer)) {
+        // True underrun - don't advance, just silence
+        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
+        m_workerActive = false;
+        return true;
+    }
 
     if (g_verbose && (count <= 5 || count % 5000 == 0)) {
+        size_t currentRingSize = m_ringBuffer.size();
         float fillPct = (currentRingSize > 0) ? (100.0f * avail / currentRingSize) : 0.0f;
+        bool currentIsDsd = m_cachedConsumerIsDsd;
         DIRETTA_LOG("getNewStream #" << count << " bpb=" << currentBytesPerBuffer
                     << " avail=" << avail << " (" << std::fixed << std::setprecision(1)
                     << fillPct << "%) " << (currentIsDsd ? "[DSD]" : "[PCM]"));
     }
 
-    // Underrun
-    if (avail < static_cast<size_t>(currentBytesPerBuffer)) {
-        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
-        std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
-        m_workerActive = false;
-        return true;
+    // Zero-copy path
+    const uint8_t* ptr;
+    size_t contiguous;
+    if (m_ringBuffer.getDirectReadRegion(static_cast<size_t>(currentBytesPerBuffer), ptr, contiguous)) {
+        // Point SDK directly at ring buffer
+        stream.Data.P = const_cast<void*>(static_cast<const void*>(ptr));
+        stream.Size = static_cast<unsigned long long>(currentBytesPerBuffer);
+        // Defer advance to next callback (SDK reads asynchronously)
+        m_pendingAdvance.store(static_cast<size_t>(currentBytesPerBuffer), std::memory_order_release);
+    } else {
+        // Wrap (data available but not contiguous) - advance to realign
+        m_ringBuffer.advanceReadPos(static_cast<size_t>(currentBytesPerBuffer));
+        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
     }
-
-    // Pop from ring buffer
-    m_ringBuffer.pop(dest, currentBytesPerBuffer);
 
     m_workerActive = false;
     return true;
@@ -1187,15 +1242,39 @@ bool DirettaSync::startSyncWorker() {
 // Internal Helpers
 //=============================================================================
 
-void DirettaSync::beginReconfigure() {
+bool DirettaSync::beginReconfigure() {
+    // Set m_reconfiguring FIRST to block new callbacks from using ring
     m_reconfiguring.store(true, std::memory_order_release);
+
+    // Wait for ringUsers to drain (existing logic)
     while (m_ringUsers.load(std::memory_order_acquire) > 0) {
         std::this_thread::yield();
     }
+
+    // Wait for SDK to release buffer
+    if (!waitForPendingRelease(std::chrono::milliseconds(200))) {
+        // Timeout: cannot safely resize
+        // Clear m_reconfiguring so callbacks can proceed
+        m_reconfiguring.store(false, std::memory_order_release);
+        return false;  // Caller must abort reconfigure
+    }
+
+    return true;  // Safe to resize
 }
 
 void DirettaSync::endReconfigure() {
     m_reconfiguring.store(false, std::memory_order_release);
+}
+
+bool DirettaSync::waitForPendingRelease(std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (m_pendingAdvance.load(std::memory_order_acquire) > 0) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;  // Timeout - SDK may still hold pointer
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
 }
 
 void DirettaSync::shutdownWorker() {

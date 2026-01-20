@@ -21,6 +21,9 @@
 #include <immintrin.h>
 #include "memcpyfast_audio.h"
 
+// Maximum ring buffer size for zero-copy SDK 148 support
+static constexpr size_t RING_BUFFER_SIZE = 1024 * 1024;  // 1MB
+
 template <typename T, size_t Alignment>
 class AlignedAllocator {
 public:
@@ -184,6 +187,51 @@ public:
     void commitDirectWrite(size_t written) {
         size_t wp = writePos_.load(std::memory_order_relaxed);
         writePos_.store((wp + written) & mask_, std::memory_order_release);
+    }
+
+    //=========================================================================
+    // Direct Read API (zero-copy consumer path for SDK 148)
+    //=========================================================================
+
+    /**
+     * @brief Get direct read pointer for zero-copy consumer access
+     *
+     * Returns a pointer to contiguous data in the ring buffer that the
+     * consumer can read directly without copying.
+     *
+     * @param needed Minimum bytes required
+     * @param region Output: pointer to contiguous read region
+     * @param avail Output: contiguous bytes available (may exceed needed)
+     * @return true if contiguous data >= needed is available, false if wrap or underrun
+     */
+    bool getDirectReadRegion(size_t needed, const uint8_t*& region, size_t& avail) const {
+        if (size_ == 0) return false;
+
+        size_t wp = writePos_.load(std::memory_order_acquire);
+        size_t rp = readPos_.load(std::memory_order_relaxed);
+        size_t total = (wp - rp) & mask_;
+
+        if (total < needed) return false;  // Underrun
+
+        size_t contiguous = std::min(size_ - rp, total);
+        if (contiguous < needed) return false;  // Wrap
+
+        region = buffer_.data() + rp;
+        avail = contiguous;
+        return true;
+    }
+
+    /**
+     * @brief Advance read position after direct read completes
+     *
+     * Must be called after consumer finishes reading from the region
+     * returned by getDirectReadRegion().
+     *
+     * @param bytes Number of bytes consumed
+     */
+    void advanceReadPos(size_t bytes) {
+        size_t rp = readPos_.load(std::memory_order_relaxed);
+        readPos_.store((rp + bytes) & mask_, std::memory_order_release);
     }
 
     //=========================================================================
