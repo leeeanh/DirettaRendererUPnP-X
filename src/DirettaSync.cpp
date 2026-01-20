@@ -623,10 +623,23 @@ void DirettaSync::close() {
     stop();
     disconnect(true);  // Wait for proper disconnection before returning
 
+    // Wait for worker thread to finish active work
     int waitCount = 0;
     while (m_workerActive.load() && waitCount < 50) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         waitCount++;
+    }
+
+    // SDK 148: Wait for buffer release before clearing state (prevent UAF)
+    auto result = blockZeroCopyAndWait(std::chrono::milliseconds(200));
+    if (result == ZeroCopyWaitResult::Released) {
+        m_pendingZeroCopyAdvance = false;
+        m_pendingAdvanceBytes = 0;
+        m_zeroCopyInUse = false;
+        m_outputBufferInUse = false;
+        m_zeroCopyBlocked = false;
+    } else {
+        DIRETTA_LOG("WARNING: Buffer release timeout in close()");
     }
 
     m_open = false;
