@@ -287,6 +287,7 @@ private:
 
     // Zero-copy helpers (SDK 148 migration)
     ZeroCopyWaitResult blockZeroCopyAndWait(std::chrono::milliseconds timeout);
+    size_t copyWithFallback(uint8_t* dest, size_t needed);
 
     class ReconfigureGuard {
     public:
