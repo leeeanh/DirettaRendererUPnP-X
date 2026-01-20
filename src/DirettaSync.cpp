@@ -682,6 +682,19 @@ bool DirettaSync::reopenForFormatChange() {
 
     stop();
     disconnect(true);
+
+    // SDK 148: Wait for buffer release before full close (prevent UAF during reopen)
+    auto result = blockZeroCopyAndWait(std::chrono::milliseconds(300));
+    if (result == ZeroCopyWaitResult::Released) {
+        m_pendingZeroCopyAdvance = false;
+        m_pendingAdvanceBytes = 0;
+        m_zeroCopyInUse = false;
+        m_outputBufferInUse = false;
+        m_zeroCopyBlocked = false;
+    } else {
+        DIRETTA_LOG("WARNING: Buffer release timeout in reopenForFormatChange");
+    }
+
     DIRETTA::Sync::close();
 
     m_running = false;
