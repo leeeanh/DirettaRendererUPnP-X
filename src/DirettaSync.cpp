@@ -451,6 +451,21 @@ bool DirettaSync::open(const AudioFormat& format) {
         configureRingPCM(format.sampleRate, format.channels, direttaBps, inputBps);
     }
 
+    // Pre-allocate fallback buffer for wraparound cases (SDK 148 migration)
+    // Size: max bytes per Diretta stream packet (for fallback when data wraps in ring)
+    size_t fallbackSize = m_bytesPerBuffer.load(std::memory_order_acquire) * 4;
+    if (m_fallbackBuffer.size() < fallbackSize) {
+        m_fallbackBuffer.resize(fallbackSize, 0x00);
+        DIRETTA_LOG("Pre-allocated fallback buffer: " << fallbackSize << " bytes");
+    }
+
+    // Reset zero-copy flags
+    m_zeroCopyInUse.store(false, std::memory_order_release);
+    m_outputBufferInUse.store(false, std::memory_order_release);
+    m_pendingZeroCopyAdvance.store(false, std::memory_order_release);
+    m_pendingAdvanceBytes.store(0, std::memory_order_release);
+    m_zeroCopyBlocked.store(false, std::memory_order_release);
+
     unsigned int cycleTimeUs = calculateCycleTime(effectiveSampleRate, effectiveChannels, bitsPerSample);
     ACQUA::Clock cycleTime = ACQUA::Clock::MicroSeconds(cycleTimeUs);
 
