@@ -702,6 +702,13 @@ void DirettaSync::fullReset() {
         m_framesPerBufferRemainder.store(0, std::memory_order_release);
         m_framesPerBufferAccumulator.store(0, std::memory_order_release);
 
+        // Clear zero-copy state (SDK 148 migration)
+        m_zeroCopyInUse.store(false, std::memory_order_release);
+        m_outputBufferInUse.store(false, std::memory_order_release);
+        m_pendingZeroCopyAdvance.store(false, std::memory_order_release);
+        m_pendingAdvanceBytes.store(0, std::memory_order_release);
+        m_zeroCopyBlocked.store(false, std::memory_order_release);
+
         m_ringBuffer.clear();
     }
 
