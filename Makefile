@@ -118,6 +118,10 @@ ifdef DIRETTA_SDK_PATH
     SDK_PATH = $(DIRETTA_SDK_PATH)
 else
     SDK_SEARCH_PATHS = \
+        ../DirettaHostSDK_148 \
+        ./DirettaHostSDK_148 \
+        $(HOME)/DirettaHostSDK_148 \
+        /opt/DirettaHostSDK_148 \
         ../DirettaHostSDK_147 \
         ./DirettaHostSDK_147 \
         $(HOME)/DirettaHostSDK_147 \
