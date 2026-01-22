@@ -1049,12 +1049,16 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     m_framesPerBufferRemainder.store(0, std::memory_order_release);
     m_framesPerBufferAccumulator.store(0, std::memory_order_release);
 
-    m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, true, false);
-    m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
+    // Aligned prefill calculation (DSD always uses 150ms)
+    m_prefillTargetBuffers = calculateAlignedPrefill(
+        bytesPerSecond, true, false, bytesPerBuffer);
+    m_prefillTarget = m_prefillTargetBuffers * bytesPerBuffer;
     m_prefillComplete = false;
 
     DIRETTA_LOG("Ring DSD: byteRate=" << byteRate << " ch=" << channels
-                << " buffer=" << ringSize << " prefill=" << m_prefillTarget);
+                << " buffer=" << ringSize
+                << " prefill=" << m_prefillTargetBuffers << " buffers ("
+                << m_prefillTarget << " bytes)");
 
     // Increment format generation to invalidate cached values
     m_formatGeneration.fetch_add(1, std::memory_order_release);
