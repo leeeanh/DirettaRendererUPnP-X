@@ -168,6 +168,27 @@ private:
     bool canBypass(uint32_t outputRate, uint32_t outputBits) const;
 };
 
+//=============================================================================
+// Callback types for backpressure-aware audio output
+//=============================================================================
+
+enum class AudioCallbackStatus { Sent, Backpressure, Stop };
+
+struct AudioCallbackResult {
+    AudioCallbackStatus status;
+    size_t bytesConsumed;  // 0..payload.bytes
+};
+
+struct AudioCallbackPayload {
+    const uint8_t* data;
+    size_t bytes;
+    size_t samples;
+};
+
+//=============================================================================
+// Audio Engine
+//=============================================================================
+
 /**
  * @brief Audio Engine with gapless playback support
  *
@@ -186,16 +207,15 @@ public:
     };
 
     /**
-     * @brief Callback for audio data ready
-     * @param buffer Audio buffer
-     * @param samples Number of samples
+     * @brief Callback for audio data with backpressure support
+     * @param payload Audio data and sample count
      * @param sampleRate Sample rate
      * @param bitDepth Bit depth
      * @param channels Number of channels
-     * @return true to continue, false to stop
+     * @return Result with status (Sent/Backpressure/Stop) and bytes consumed
      */
-    using AudioCallback = std::function<bool(const AudioBuffer&, size_t,
-                                            uint32_t, uint32_t, uint32_t)>;
+    using AudioCallback = std::function<AudioCallbackResult(
+        const AudioCallbackPayload&, uint32_t, uint32_t, uint32_t)>;
 
     /**
      * @brief Callback for track change
