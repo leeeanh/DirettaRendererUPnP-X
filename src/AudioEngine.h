@@ -129,6 +129,29 @@ public:
      */
     bool seek(double seconds);
 
+    /**
+     * @brief Access the PCM FIFO directly
+     * @return Pointer to AVAudioFifo or nullptr
+     */
+    AVAudioFifo* getFifo() { return m_pcmFifo; }
+
+    /**
+     * @brief Ensure FIFO is allocated and configured
+     * @param outputRate Sample rate
+     * @param outputBits Bit depth
+     * @return true if successful
+     */
+    bool ensureFifo(uint32_t outputRate, uint32_t outputBits);
+
+    /**
+     * @brief Decode until FIFO reaches target sample count
+     * @param targetSamples Target fill level
+     * @param outputRate Sample rate
+     * @param outputBits Bit depth
+     * @return Samples now in FIFO
+     */
+    size_t fillFifo(size_t targetSamples, uint32_t outputRate, uint32_t outputBits);
+
 private:
     AVFormatContext* m_formatContext;
     AVCodecContext* m_codecContext;
@@ -163,6 +186,13 @@ private:
     // PCM bypass mode - skip resampler when formats match exactly
     bool m_bypassMode = false;
     bool m_resamplerInitialized = false;
+
+    // FIFO spill buffer for partial writes
+    AudioBuffer m_fifoPendingBuffer;
+    size_t m_fifoPendingBytes = 0;
+    size_t m_fifoPendingOffset = 0;
+
+    void resetFifoPending();  // Clear spill state on seek/track change
 
     bool initResampler(uint32_t outputRate, uint32_t outputBits);
     bool canBypass(uint32_t outputRate, uint32_t outputBits) const;
