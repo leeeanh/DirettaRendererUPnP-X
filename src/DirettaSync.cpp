@@ -933,7 +933,33 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
 // Ring Buffer Configuration
 //=============================================================================
 
-void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int inputBps) {
+size_t DirettaSync::calculateAlignedPrefill(size_t bytesPerSecond, bool isDSD,
+                                             bool isCompressed, size_t bytesPerBuffer) {
+    // Target fill based on format complexity
+    int targetMs = isCompressed ? AudioTiming::JITTER_TARGET_COMPRESSED
+                                : AudioTiming::JITTER_TARGET_UNCOMPRESSED;
+
+    // DSD uses fixed 150ms (not affected by compression flag)
+    if (isDSD) {
+        targetMs = 150;
+    }
+
+    // Convert to bytes
+    size_t targetBytes = (bytesPerSecond * targetMs) / 1000;
+
+    // Align UP to whole buffer boundary
+    size_t targetBuffers = (targetBytes + bytesPerBuffer - 1) / bytesPerBuffer;
+
+    // Clamp to reasonable bounds (min 8 buffers, max 1/4 ring)
+    size_t ringSize = m_ringBuffer.size();
+    size_t maxBuffers = ringSize / (4 * bytesPerBuffer);
+    targetBuffers = std::max(targetBuffers, size_t{8});
+    targetBuffers = std::min(targetBuffers, maxBuffers);
+
+    return targetBuffers;
+}
+
+void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int inputBps, bool isCompressed) {
     std::lock_guard<std::mutex> lock(m_configMutex);
     ReconfigureGuard guard(*this);
 
