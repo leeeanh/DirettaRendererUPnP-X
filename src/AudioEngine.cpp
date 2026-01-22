@@ -1595,220 +1595,9 @@ double AudioEngine::getPosition() const {
 }
 
 bool AudioEngine::process(size_t samplesNeeded) {
-    // CRITICAL: Process async seek request (lock-free check)
-    // This runs in the audio thread, so we can safely take the mutex
-    if (m_seekRequested.load(std::memory_order_acquire)) {
-        double targetSeconds = m_seekTarget.load(std::memory_order_acquire);
-        m_seekRequested.store(false, std::memory_order_release);
-
-        std::cout << "[AudioEngine] Processing async seek to " << targetSeconds << "s" << std::endl;
-
-        // Now we can safely take the mutex (we're in the audio thread)
-        std::lock_guard<std::mutex> seekLock(m_mutex);
-
-        // Validate decoder exists
-        if (!m_currentDecoder) {
-            std::cerr << "[AudioEngine] No decoder for seek" << std::endl;
-            // Don't return false - continue playing
-        } else {
-            // Validate position
-            const TrackInfo& info = m_currentTrackInfo;
-            if (info.sampleRate > 0 && info.duration > 0) {
-                double maxSeconds = static_cast<double>(info.duration) / info.sampleRate;
-                if (targetSeconds > maxSeconds) {
-                    targetSeconds = maxSeconds;
-                }
-                if (targetSeconds < 0) {
-                    targetSeconds = 0;
-                }
-
-                // Perform the actual seek
-                if (m_currentDecoder->seek(targetSeconds)) {
-                    // Update position
-                    m_samplesPlayed = static_cast<uint64_t>(targetSeconds * info.sampleRate);
-
-                    // Reset drainage counters
-                    m_silenceCount = 0;
-                    m_isDraining = false;
-
-                    std::cout << "[AudioEngine] Seek completed to " << targetSeconds << "s" << std::endl;
-                    DEBUG_LOG("[AudioEngine] Position updated to "
-                              << m_samplesPlayed << " samples (" << targetSeconds << "s)");
-                } else {
-                    std::cerr << "[AudioEngine] Seek failed in decoder" << std::endl;
-                }
-            }
-        }
-
-        // Continue processing after seek
-    }
-
-    std::lock_guard<std::mutex> lock(m_mutex);
-    // Double vérification avec mutex
-    if (m_state.load() != State::PLAYING) {
-        return false;
-    }
-
-    // Apply pending next URI from UPnP thread
-    if (m_pendingNextTrack.load(std::memory_order_acquire)) {
-        {
-            std::lock_guard<std::mutex> pendingLock(m_pendingMutex);
-            m_nextURI = m_pendingNextURI;
-            m_nextMetadata = m_pendingNextMetadata;
-            m_pendingNextURI.clear();
-            m_pendingNextMetadata.clear();
-        }
-        m_pendingNextTrack.store(false, std::memory_order_release);
-        std::cout << "[AudioEngine] Pending next URI applied (gapless)" << std::endl;
-    }
-
-    // Safety net: auto-reopen if decoder null while PLAYING
-    if (!m_currentDecoder) {
-        if (!m_currentURI.empty()) {
-            if (!openCurrentTrack()) {
-                std::cerr << "[AudioEngine] Failed to reopen track" << std::endl;
-                m_state = State::STOPPED;
-                if (m_trackEndCallback) {
-                    m_trackEndCallback();
-                }
-                return false;
-            }
-            m_samplesPlayed = 0;
-            m_silenceCount = 0;
-            m_isDraining = false;
-        } else {
-            return false;
-        }
-    }
-
-    // Determine output format
-    uint32_t outputRate = m_currentTrackInfo.sampleRate;
-    uint32_t outputBits = m_currentTrackInfo.bitDepth;
-    uint32_t outputChannels = m_currentTrackInfo.channels;
-
-    // For DSD, keep native rate and bit depth
-    if (!m_currentTrackInfo.isDSD) {
-        // For PCM, we can target specific output format if needed
-        // For now, keep source format (bit-perfect)
-    }
-
-    // Read samples from decoder
-    size_t samplesRead = m_currentDecoder->readSamples(
-        m_buffer,
-        samplesNeeded,
-        outputRate,
-        outputBits
-    );
-
-    // CRITICAL: Preload next track as soon as EOF flag is set (for gapless)
-    // Check AFTER readSamples() because EOF flag is set during the read
-    if (!m_nextDecoder && !m_nextURI.empty() && m_currentDecoder->isEOF()) {
-        std::cout << "[AudioEngine] EOF flag detected, preloading next track for gapless..." << std::endl;
-        preloadNextTrack();
-    }
-
-    if (samplesRead > 0) {
-        // Call audio callback to send data to output
-        if (m_audioCallback) {
-            bool continuePlayback = m_audioCallback(
-                m_buffer,
-                samplesRead,
-                outputRate,
-                outputBits,
-                outputChannels
-            );
-
-            if (!continuePlayback) {
-                std::cout << "[AudioEngine] Playback stopped by callback" << std::endl;
-                m_state = State::STOPPED;
-                return false;
-            }
-        }
-
-        m_samplesPlayed += samplesRead;
-    }
-
-    // Check for actual end of data (no more samples can be read)
-    if (samplesRead == 0) {
-
-        // Log "Track finished" only once
-        if (!m_isDraining) {
-            std::cout << "[AudioEngine] No more samples available from decoder" << std::endl;
-            m_isDraining = true;
-            m_silenceCount = 0;
-        }
-
-        // Check if we have a next track ready for gapless
-        if (m_nextDecoder) {
-            std::cout << "[AudioEngine] Transitioning to next track (gapless)..." << std::endl;
-            m_isDraining = false;
-            transitionToNextTrack();
-            return true;  // Continue playback with new track
-        }
-
-        // NEW (v1.0.16): Check if next track exists but decoder was cleared (format change)
-        if (!m_nextURI.empty()) {
-            std::cout << "[AudioEngine] Next track with format change detected" << std::endl;
-            std::cout << "[AudioEngine] Transitioning with stop/start sequence..." << std::endl;
-
-            // Save next URI before stopping
-            std::string nextURI = m_nextURI;
-            std::string nextMetadata = m_nextMetadata;
-
-            // Signal track end to allow clean transition
-            if (m_trackEndCallback) {
-                m_trackEndCallback();
-            }
-
-            // Apply next URI as current
-            m_currentURI = nextURI;
-            m_currentMetadata = nextMetadata;
-            m_nextURI.clear();
-            m_nextMetadata.clear();
-
-            // Reset for new track
-            m_isDraining = false;
-            m_samplesPlayed = 0;
-            m_trackNumber++;
-
-            // Stop current playback (will close DirettaOutput)
-            std::cout << "[AudioEngine] Stopping for format change..." << std::endl;
-            m_currentDecoder.reset();
-
-            // Reopen with new track (will be done in next process() call via openCurrentTrack())
-            return true;  // Continue playback state
-        }
-
-        // No next track - drain buffer and stop
-        std::cout << "[AudioEngine] No next track, draining buffer..." << std::endl;
-
-        if (m_silenceCount == 0) {
-            std::cout << "[AudioEngine] No next track, waiting for Diretta drain..." << std::endl;
-        }
-
-        m_silenceCount++;
-
-        // After a short wait to ensure last samples were sent, signal stop
-        // Diretta has ~2-4s of buffer, but we don't need to send silence
-        // The stop() function will wait for buffer_empty()
-        if (m_silenceCount > 5) {  // 5 * ~92ms = ~500ms safety margin
-            std::cout << "[AudioEngine] Last samples sent, signaling stop" << std::endl;
-            m_silenceCount = 0;
-            m_isDraining = false;
-            m_state = State::STOPPED;
-
-            if (m_trackEndCallback) {
-                m_trackEndCallback();
-            }
-
-            return false;  // Stop processing, let DirettaOutput::stop() drain
-        }
-
-        // Return false to stop sending samples, but keep state as PLAYING briefly
-        return false;
-    }
-
-    return true;
+    // For now, use processLegacy for all paths (DSD and PCM without jitter buffer)
+    // This will be replaced with jitter buffer logic in later tasks
+    return processLegacy(samplesNeeded);
 }
 
 bool AudioEngine::openCurrentTrack() {
@@ -1942,6 +1731,220 @@ void AudioEngine::resetJitterState() {
     if (m_currentDecoder) {
         m_currentDecoder->resetFifoPending();
     }
+}
+
+bool AudioEngine::processLegacy(size_t samplesNeeded) {
+    // CRITICAL: Process async seek request (lock-free check)
+    // This runs in the audio thread, so we can safely take the mutex
+    if (m_seekRequested.load(std::memory_order_acquire)) {
+        double targetSeconds = m_seekTarget.load(std::memory_order_acquire);
+        m_seekRequested.store(false, std::memory_order_release);
+
+        std::cout << "[AudioEngine] Processing async seek to " << targetSeconds << "s" << std::endl;
+
+        // Now we can safely take the mutex (we're in the audio thread)
+        std::lock_guard<std::mutex> seekLock(m_mutex);
+
+        // Validate decoder exists
+        if (!m_currentDecoder) {
+            std::cerr << "[AudioEngine] No decoder for seek" << std::endl;
+            // Don't return false - continue playing
+        } else {
+            // Validate position
+            const TrackInfo& info = m_currentTrackInfo;
+            if (info.sampleRate > 0 && info.duration > 0) {
+                double maxSeconds = static_cast<double>(info.duration) / info.sampleRate;
+                if (targetSeconds > maxSeconds) {
+                    targetSeconds = maxSeconds;
+                }
+                if (targetSeconds < 0) {
+                    targetSeconds = 0;
+                }
+
+                // Perform the actual seek
+                if (m_currentDecoder->seek(targetSeconds)) {
+                    // Update position
+                    m_samplesPlayed = static_cast<uint64_t>(targetSeconds * info.sampleRate);
+
+                    // Reset drainage counters
+                    m_silenceCount = 0;
+                    m_isDraining = false;
+
+                    std::cout << "[AudioEngine] Seek completed to " << targetSeconds << "s" << std::endl;
+                    DEBUG_LOG("[AudioEngine] Position updated to "
+                              << m_samplesPlayed << " samples (" << targetSeconds << "s)");
+                } else {
+                    std::cerr << "[AudioEngine] Seek failed in decoder" << std::endl;
+                }
+            }
+        }
+
+        // Continue processing after seek
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // Double vérification avec mutex
+    if (m_state.load() != State::PLAYING) {
+        return false;
+    }
+
+    // Apply pending next URI from UPnP thread
+    if (m_pendingNextTrack.load(std::memory_order_acquire)) {
+        {
+            std::lock_guard<std::mutex> pendingLock(m_pendingMutex);
+            m_nextURI = m_pendingNextURI;
+            m_nextMetadata = m_pendingNextMetadata;
+            m_pendingNextURI.clear();
+            m_pendingNextMetadata.clear();
+        }
+        m_pendingNextTrack.store(false, std::memory_order_release);
+        std::cout << "[AudioEngine] Pending next URI applied (gapless)" << std::endl;
+    }
+
+    // Safety net: auto-reopen if decoder null while PLAYING
+    if (!m_currentDecoder) {
+        if (!m_currentURI.empty()) {
+            if (!openCurrentTrack()) {
+                std::cerr << "[AudioEngine] Failed to reopen track" << std::endl;
+                m_state = State::STOPPED;
+                if (m_trackEndCallback) {
+                    m_trackEndCallback();
+                }
+                return false;
+            }
+            m_samplesPlayed = 0;
+            m_silenceCount = 0;
+            m_isDraining = false;
+        } else {
+            return false;
+        }
+    }
+
+    // Determine output format
+    uint32_t outputRate = m_currentTrackInfo.sampleRate;
+    uint32_t outputBits = m_currentTrackInfo.bitDepth;
+    uint32_t outputChannels = m_currentTrackInfo.channels;
+
+    // For DSD, keep native rate and bit depth
+    if (!m_currentTrackInfo.isDSD) {
+        // For PCM, we can target specific output format if needed
+        // For now, keep source format (bit-perfect)
+    }
+
+    // Read samples from decoder
+    size_t samplesRead = m_currentDecoder->readSamples(
+        m_buffer,
+        samplesNeeded,
+        outputRate,
+        outputBits
+    );
+
+    // CRITICAL: Preload next track as soon as EOF flag is set (for gapless)
+    // Check AFTER readSamples() because EOF flag is set during the read
+    if (!m_nextDecoder && !m_nextURI.empty() && m_currentDecoder->isEOF()) {
+        std::cout << "[AudioEngine] EOF flag detected, preloading next track for gapless..." << std::endl;
+        preloadNextTrack();
+    }
+
+    if (samplesRead > 0) {
+        // Call audio callback to send data to output
+        if (m_audioCallback) {
+            // Legacy callback expects bool return
+            // Wrap new result in bool for compatibility
+            AudioCallbackPayload payload{m_buffer.data(), samplesRead * (outputBits <= 16 ? 2 : 4) * outputChannels, samplesRead};
+            AudioCallbackResult result = m_audioCallback(payload, outputRate, outputBits, outputChannels);
+            
+            if (result.status == AudioCallbackStatus::Stop) {
+                std::cout << "[AudioEngine] Playback stopped by callback" << std::endl;
+                m_state = State::STOPPED;
+                return false;
+            }
+        }
+
+        m_samplesPlayed += samplesRead;
+    }
+
+    // Check for actual end of data (no more samples can be read)
+    if (samplesRead == 0) {
+
+        // Log "Track finished" only once
+        if (!m_isDraining) {
+            std::cout << "[AudioEngine] No more samples available from decoder" << std::endl;
+            m_isDraining = true;
+            m_silenceCount = 0;
+        }
+
+        // Check if we have a next track ready for gapless
+        if (m_nextDecoder) {
+            std::cout << "[AudioEngine] Transitioning to next track (gapless)..." << std::endl;
+            m_isDraining = false;
+            transitionToNextTrack();
+            return true;  // Continue playback with new track
+        }
+
+        // NEW (v1.0.16): Check if next track exists but decoder was cleared (format change)
+        if (!m_nextURI.empty()) {
+            std::cout << "[AudioEngine] Next track with format change detected" << std::endl;
+            std::cout << "[AudioEngine] Transitioning with stop/start sequence..." << std::endl;
+
+            // Save next URI before stopping
+            std::string nextURI = m_nextURI;
+            std::string nextMetadata = m_nextMetadata;
+
+            // Signal track end to allow clean transition
+            if (m_trackEndCallback) {
+                m_trackEndCallback();
+            }
+
+            // Apply next URI as current
+            m_currentURI = nextURI;
+            m_currentMetadata = nextMetadata;
+            m_nextURI.clear();
+            m_nextMetadata.clear();
+
+            // Reset for new track
+            m_isDraining = false;
+            m_samplesPlayed = 0;
+            m_trackNumber++;
+
+            // Stop current playback (will close DirettaOutput)
+            std::cout << "[AudioEngine] Stopping for format change..." << std::endl;
+            m_currentDecoder.reset();
+
+            // Reopen with new track (will be done in next process() call via openCurrentTrack())
+            return true;  // Continue playback state
+        }
+
+        // No next track - drain buffer and stop
+        std::cout << "[AudioEngine] No next track, draining buffer..." << std::endl;
+
+        if (m_silenceCount == 0) {
+            std::cout << "[AudioEngine] No next track, waiting for Diretta drain..." << std::endl;
+        }
+
+        m_silenceCount++;
+
+        // After a short wait to ensure last samples were sent, signal stop
+        // Diretta has ~2-4s of buffer, but we don't need to send silence
+        // The stop() function will wait for buffer_empty()
+        if (m_silenceCount > 5) {  // 5 * ~92ms = ~500ms safety margin
+            std::cout << "[AudioEngine] Last samples sent, signaling stop" << std::endl;
+            m_silenceCount = 0;
+            m_isDraining = false;
+            m_state = State::STOPPED;
+
+            if (m_trackEndCallback) {
+                m_trackEndCallback();
+            }
+
+            return false;  // Stop processing, let DirettaOutput::stop() drain
+        }
+
+        // Return false to stop sending samples, but keep state as PLAYING briefly
+        return false;
+    }
+
+    return true;
 }
 
 bool AudioDecoder::seek(double seconds) {

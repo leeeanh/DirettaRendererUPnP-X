@@ -420,6 +420,7 @@ private:
     bool preloadNextTrack();
     void transitionToNextTrack();
     void resetJitterState();
+    bool processLegacy(size_t samplesNeeded);  // Original path for DSD
 
     // Thread-safe pending next track mechanism
     mutable std::mutex m_pendingMutex;
