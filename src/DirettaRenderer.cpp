@@ -543,28 +543,6 @@ void DirettaRenderer::upnpThreadFunc() {
     DEBUG_LOG("[UPnP Thread] Stopped");
 }
 
-size_t DirettaRenderer::calculateAdaptiveChunkSize(size_t baseSize, float bufferLevel) const {
-    constexpr float TARGET_LEVEL = 0.50f;
-    constexpr float DEADBAND = 0.10f;
-    constexpr float MIN_SCALE = 0.25f;
-    constexpr float MAX_SCALE = 1.50f;
-
-    float scale = 1.0f;
-    float deviation = bufferLevel - TARGET_LEVEL;
-
-    if (deviation > DEADBAND) {
-        // Buffer too full - reduce chunk size
-        scale = 1.0f - ((deviation - DEADBAND) / (1.0f - TARGET_LEVEL - DEADBAND));
-        scale = std::max(scale, MIN_SCALE);
-    } else if (deviation < -DEADBAND) {
-        // Buffer too empty - increase chunk size
-        scale = 1.0f + ((-deviation - DEADBAND) / (TARGET_LEVEL - DEADBAND)) * 0.5f;
-        scale = std::min(scale, MAX_SCALE);
-    }
-
-    return static_cast<size_t>(baseSize * scale);
-}
-
 size_t DirettaRenderer::selectChunkSize(uint32_t sampleRate, bool isDSD) const {
     if (isDSD) return AudioTiming::DSD_CHUNK;
     if (sampleRate <= 48000) return AudioTiming::PCM_CHUNK_LOW;
