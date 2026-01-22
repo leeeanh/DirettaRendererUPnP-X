@@ -1595,9 +1595,284 @@ double AudioEngine::getPosition() const {
 }
 
 bool AudioEngine::process(size_t samplesNeeded) {
-    // For now, use processLegacy for all paths (DSD and PCM without jitter buffer)
-    // This will be replaced with jitter buffer logic in later tasks
-    return processLegacy(samplesNeeded);
+    // CRITICAL: Process async seek request (lock-free check)
+    if (m_seekRequested.load(std::memory_order_acquire)) {
+        double targetSeconds = m_seekTarget.load(std::memory_order_acquire);
+        m_seekRequested.store(false, std::memory_order_release);
+        resetJitterState();
+
+        std::cout << "[AudioEngine] Processing async seek to " << targetSeconds << "s" << std::endl;
+        std::lock_guard<std::mutex> seekLock(m_mutex);
+
+        if (m_currentDecoder) {
+            const TrackInfo& info = m_currentTrackInfo;
+            if (info.sampleRate > 0 && info.duration > 0) {
+                double maxSeconds = static_cast<double>(info.duration) / info.sampleRate;
+                if (targetSeconds > maxSeconds) targetSeconds = maxSeconds;
+                if (targetSeconds < 0) targetSeconds = 0;
+
+                if (m_currentDecoder->seek(targetSeconds)) {
+                    m_samplesPlayed = static_cast<uint64_t>(targetSeconds * info.sampleRate);
+                    m_silenceCount = 0;
+                    m_isDraining = false;
+                    DEBUG_LOG("[AudioEngine] Seek completed to " << targetSeconds << "s");
+                }
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_state.load() != State::PLAYING) {
+        return false;
+    }
+
+    // Apply pending next URI from UPnP thread
+    if (m_pendingNextTrack.load(std::memory_order_acquire)) {
+        {
+            std::lock_guard<std::mutex> pendingLock(m_pendingMutex);
+            m_nextURI = m_pendingNextURI;
+            m_nextMetadata = m_pendingNextMetadata;
+            m_pendingNextURI.clear();
+            m_pendingNextMetadata.clear();
+        }
+        m_pendingNextTrack.store(false, std::memory_order_release);
+        std::cout << "[AudioEngine] Pending next URI applied (gapless)" << std::endl;
+    }
+
+    // Safety net: auto-reopen if decoder null while PLAYING
+    if (!m_currentDecoder) {
+        if (!m_currentURI.empty()) {
+            if (!openCurrentTrack()) {
+                m_state = State::STOPPED;
+                if (m_trackEndCallback) m_trackEndCallback();
+                return false;
+            }
+            m_samplesPlayed = 0;
+            m_silenceCount = 0;
+            m_isDraining = false;
+        } else {
+            return false;
+        }
+    }
+
+    const TrackInfo& info = m_currentTrackInfo;
+    uint32_t outputRate = info.sampleRate;
+    uint32_t outputBits = info.bitDepth;
+    uint32_t outputChannels = info.channels;
+
+    // Ensure FIFO exists before selecting jitter-buffer path
+    if (!m_currentDecoder->isEOF() && !m_currentDecoder->getFifo()) {
+        if (!m_currentDecoder->ensureFifo(outputRate, outputBits)) {
+            return false;
+        }
+    }
+
+    AVAudioFifo* fifo = m_currentDecoder->getFifo();
+    if (!fifo) {
+        // DSD or still no FIFO - use original path
+        return processLegacy(samplesNeeded);
+    }
+
+    // Calculate jitter buffer target (once per track)
+    if (m_jitterTargetSamples == 0 && outputRate > 0) {
+        int targetMs = info.isCompressed
+            ? AudioTiming::JITTER_TARGET_COMPRESSED
+            : AudioTiming::JITTER_TARGET_UNCOMPRESSED;
+        size_t desiredTarget = (outputRate * targetMs) / 1000;
+
+        // Clamp to FIFO capacity
+        size_t fifoCapacity = static_cast<size_t>(av_audio_fifo_size(fifo)) +
+                              static_cast<size_t>(av_audio_fifo_space(fifo));
+        if (fifoCapacity > 0) {
+            m_jitterTargetSamples = std::min(desiredTarget, fifoCapacity);
+            if (m_jitterTargetSamples < desiredTarget) {
+                DEBUG_LOG("[AudioEngine] Jitter target clamped to FIFO capacity: "
+                          << m_jitterTargetSamples << "/" << desiredTarget);
+            }
+        } else {
+            m_jitterTargetSamples = desiredTarget;
+        }
+
+        m_jitterMinSamples = std::max<size_t>(1, m_jitterTargetSamples / 4);
+        DEBUG_LOG("[AudioEngine] Jitter target: " << m_jitterTargetSamples
+                  << " samples");
+    }
+
+    size_t bytesPerSample = (outputBits <= 16) ? 2 : 4;
+    bytesPerSample *= outputChannels;
+    auto bytesToSamples = [&](size_t bytes) -> size_t {
+        return info.isDSD ? (bytes * 8) / outputChannels : bytes / bytesPerSample;
+    };
+    auto alignBytesToSample = [&](size_t bytes) -> size_t {
+        size_t sampleBytes = info.isDSD ? (outputChannels / 8) : bytesPerSample;
+        if (sampleBytes == 0) return 0;
+        return bytes - (bytes % sampleBytes);
+    };
+
+    // Phase 1: FILL - Top up jitter buffer to target
+    if (!m_jitterBufferReady) {
+        while (!m_currentDecoder->isEOF()) {
+            size_t fifoLevel = av_audio_fifo_size(fifo);
+            if (fifoLevel >= m_jitterTargetSamples) {
+                m_jitterBufferReady = true;
+                DEBUG_LOG("[AudioEngine] Jitter buffer ready: " << fifoLevel << " samples");
+                break;
+            }
+            size_t added = m_currentDecoder->fillFifo(m_jitterTargetSamples, outputRate, outputBits);
+            if (added == 0 && !m_currentDecoder->isEOF()) {
+                DEBUG_LOG("[AudioEngine] fillFifo made no progress; stopping");
+                m_state = State::STOPPED;
+                return false;
+            }
+        }
+
+        if (!m_jitterBufferReady && !m_currentDecoder->isEOF()) {
+            return false;
+        }
+        m_jitterBufferReady = true;
+    }
+
+    // Phase 2: MAINTAIN - Keep buffer topped up (non-blocking)
+    if (!m_currentDecoder->isEOF()) {
+        size_t fifoLevel = av_audio_fifo_size(fifo);
+        if (fifoLevel < m_jitterTargetSamples) {
+            size_t added = m_currentDecoder->fillFifo(m_jitterTargetSamples, outputRate, outputBits);
+            if (added == 0 && !m_currentDecoder->isEOF()) {
+                DEBUG_LOG("[AudioEngine] fillFifo made no progress");
+                m_state = State::STOPPED;
+                return false;
+            }
+        }
+    }
+
+    // Phase 2b: RETRY pending output on backpressure
+    if (m_pendingBytes > 0) {
+        if (m_audioCallback) {
+            size_t alignedPendingBytes = alignBytesToSample(m_pendingBytes);
+            size_t pendingSamples = bytesToSamples(alignedPendingBytes);
+            AudioCallbackPayload payload{
+                m_outputBuffer.data() + m_pendingByteOffset,
+                alignedPendingBytes,
+                pendingSamples
+            };
+            AudioCallbackResult result = m_audioCallback(
+                payload, outputRate, outputBits, outputChannels);
+            if (result.status == AudioCallbackStatus::Stop) {
+                m_state = State::STOPPED;
+                return false;
+            }
+
+            size_t consumedBytes = std::min(result.bytesConsumed, alignedPendingBytes);
+            consumedBytes = alignBytesToSample(consumedBytes);
+            if (consumedBytes > 0) {
+                size_t consumedSamples = bytesToSamples(consumedBytes);
+                consumedSamples = std::min(consumedSamples, m_pendingSamples);
+                m_pendingByteOffset += consumedBytes;
+                m_pendingBytes -= consumedBytes;
+                m_pendingSamples = bytesToSamples(alignBytesToSample(m_pendingBytes));
+                m_samplesPlayed += consumedSamples;
+            }
+
+            if (result.status == AudioCallbackStatus::Backpressure || m_pendingBytes > 0) {
+                return false;
+            }
+        }
+        m_pendingBytes = 0;
+        m_pendingByteOffset = 0;
+        m_pendingSamples = 0;
+        return true;
+    }
+
+    // Phase 3: DRAIN - Output exactly samplesNeeded
+    size_t fifoLevel = av_audio_fifo_size(fifo);
+    size_t toOutput = samplesNeeded;
+
+    if (fifoLevel < samplesNeeded) {
+        if (fifoLevel < m_jitterMinSamples && fifoLevel > 0) {
+            DEBUG_LOG("[AudioEngine] Jitter buffer low: " << fifoLevel);
+        }
+        toOutput = fifoLevel;
+    }
+
+    if (toOutput == 0) {
+        // Buffer empty - check for track transition
+        if (m_currentDecoder->isEOF()) {
+            if (m_nextDecoder) {
+                DEBUG_LOG("[AudioEngine] EOF, transitioning to next track");
+                transitionToNextTrack();
+                return true;
+            }
+            if (!m_nextURI.empty()) {
+                DEBUG_LOG("[AudioEngine] EOF with format change");
+                m_currentURI = m_nextURI;
+                m_currentMetadata = m_nextMetadata;
+                m_nextURI.clear();
+                m_nextMetadata.clear();
+                m_isDraining = false;
+                m_samplesPlayed = 0;
+                m_trackNumber++;
+                m_currentDecoder.reset();
+                resetJitterState();
+                return true;
+            }
+            // No next track - drain and stop
+            m_silenceCount++;
+            if (m_silenceCount > 5) {
+                DEBUG_LOG("[AudioEngine] EOF, stopping");
+                m_state = State::STOPPED;
+                if (m_trackEndCallback) m_trackEndCallback();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // Ensure output buffer capacity (grow-only)
+    m_outputBuffer.ensureCapacity(toOutput * bytesPerSample);
+    m_outputBuffer.resize(toOutput * bytesPerSample);
+
+    // Drain from FIFO
+    uint8_t* outPtr = m_outputBuffer.data();
+    int read = av_audio_fifo_read(fifo, (void**)&outPtr, toOutput);
+
+    if (read <= 0) {
+        return false;
+    }
+
+    size_t bytesToOutput = static_cast<size_t>(read) * bytesPerSample;
+    m_outputBuffer.resize(bytesToOutput);
+
+    // Phase 4: SEND - Non-blocking with backpressure
+    if (m_audioCallback) {
+        size_t alignedBytesToOutput = alignBytesToSample(bytesToOutput);
+        size_t alignedSamplesToOutput = bytesToSamples(alignedBytesToOutput);
+        AudioCallbackPayload payload{
+            m_outputBuffer.data(),
+            alignedBytesToOutput,
+            alignedSamplesToOutput
+        };
+        AudioCallbackResult result = m_audioCallback(
+            payload, outputRate, outputBits, outputChannels);
+        if (result.status == AudioCallbackStatus::Stop) {
+            m_state = State::STOPPED;
+            return false;
+        }
+
+        size_t consumedBytes = std::min(result.bytesConsumed, alignedBytesToOutput);
+        consumedBytes = alignBytesToSample(consumedBytes);
+        if (consumedBytes < alignedBytesToOutput) {
+            size_t consumedSamples = bytesToSamples(consumedBytes);
+            consumedSamples = std::min(consumedSamples, alignedSamplesToOutput);
+            m_pendingBytes = alignedBytesToOutput - consumedBytes;
+            m_pendingByteOffset = consumedBytes;
+            m_pendingSamples = alignedSamplesToOutput - consumedSamples;
+            m_samplesPlayed += consumedSamples;
+            return false;
+        }
+    }
+
+    m_samplesPlayed += read;
+    return true;
 }
 
 bool AudioEngine::openCurrentTrack() {
