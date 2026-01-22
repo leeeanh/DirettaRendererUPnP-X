@@ -1918,6 +1918,7 @@ void AudioEngine::transitionToNextTrack() {
     m_currentDecoder = std::move(m_nextDecoder);
     m_trackNumber++;
     m_samplesPlayed = 0;
+    resetJitterState();
 
     // Clear next URI after moving to current
     m_nextURI.clear();
@@ -1928,6 +1929,18 @@ void AudioEngine::transitionToNextTrack() {
         if (m_trackChangeCallback) {
             m_trackChangeCallback(m_trackNumber, m_currentTrackInfo, m_currentURI, m_currentMetadata);
         }
+    }
+}
+
+void AudioEngine::resetJitterState() {
+    m_jitterTargetSamples = 0;
+    m_jitterMinSamples = 0;
+    m_jitterBufferReady = false;
+    m_pendingBytes = 0;
+    m_pendingByteOffset = 0;
+    m_pendingSamples = 0;
+    if (m_currentDecoder) {
+        m_currentDecoder->resetFifoPending();
     }
 }
 

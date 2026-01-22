@@ -419,6 +419,7 @@ private:
     bool openCurrentTrack();
     bool preloadNextTrack();
     void transitionToNextTrack();
+    void resetJitterState();
 
     // Thread-safe pending next track mechanism
     mutable std::mutex m_pendingMutex;
