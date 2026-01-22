@@ -63,13 +63,20 @@ public:
     AudioBuffer& operator=(AudioBuffer&& other) noexcept;
 
     void resize(size_t size);
+    void ensureCapacity(size_t cap);    // Pre-allocate without changing logical size
     size_t size() const { return m_size; }
+    size_t capacity() const { return m_capacity; }
     uint8_t* data() { return m_data; }
     const uint8_t* data() const { return m_data; }
 
 private:
     uint8_t* m_data;
     size_t m_size;
+    size_t m_capacity = 0;  // NEW: track allocated capacity
+
+    static constexpr size_t ALIGNMENT = 64;  // AVX-512 cacheline
+    
+    void growCapacity(size_t needed);
 };
 
 /**
