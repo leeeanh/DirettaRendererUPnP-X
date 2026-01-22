@@ -4,6 +4,7 @@
  */
 
 #include "AudioEngine.h"
+#include "AudioTiming.h"
 #include <iostream>
 #include <thread>
 #include <cstring>

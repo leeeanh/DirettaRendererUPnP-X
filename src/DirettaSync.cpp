@@ -7,6 +7,7 @@
  */
 
 #include "DirettaSync.h"
+#include "AudioTiming.h"
 #include <stdexcept>
 #include <iomanip>
 

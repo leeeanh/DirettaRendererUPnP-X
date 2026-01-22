@@ -10,6 +10,7 @@
 #include "DirettaRingBuffer.h"
 #include "UPnPDevice.hpp"
 #include "AudioEngine.h"
+#include "AudioTiming.h"
 #include <chrono>
 #include <ctime>
 #include <iomanip>
