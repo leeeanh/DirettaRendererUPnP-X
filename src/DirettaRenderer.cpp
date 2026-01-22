@@ -161,17 +161,15 @@ bool DirettaRenderer::start() {
         //=====================================================================
 
         m_audioEngine->setAudioCallback(
-            [this](const AudioBuffer& buffer, size_t samples,
-                   uint32_t sampleRate, uint32_t bitDepth, uint32_t channels) -> bool {
+            [this](const AudioCallbackPayload& payload,
+                   uint32_t sampleRate, uint32_t bitDepth, uint32_t channels) -> AudioCallbackResult {
 
                 // CRITICAL: Set running flag FIRST, then check shutdown.
-                // This order prevents a race where stopper checks m_callbackRunning
-                // before we set it, but after checking m_shutdownRequested.
                 m_callbackRunning.store(true, std::memory_order_seq_cst);
 
                 if (m_shutdownRequested.load(std::memory_order_seq_cst)) {
                     m_callbackRunning.store(false, std::memory_order_release);
-                    return false;
+                    return { AudioCallbackStatus::Stop, 0 };
                 }
 
                 struct Guard {
@@ -188,35 +186,23 @@ bool DirettaRenderer::start() {
 
                 if (trackInfo.isDSD) {
                     format.bitDepth = 1;
-                    // Use detected source format (from file extension or codec)
                     if (trackInfo.dsdSourceFormat == TrackInfo::DSDSourceFormat::DSF) {
                         format.dsdFormat = AudioFormat::DSDFormat::DSF;
-                        DEBUG_LOG("[Callback] DSD format: DSF (LSB first)");
+                        DEBUG_LOG("[Callback] DSD format: DSF");
                     } else if (trackInfo.dsdSourceFormat == TrackInfo::DSDSourceFormat::DFF) {
                         format.dsdFormat = AudioFormat::DSDFormat::DFF;
-                        DEBUG_LOG("[Callback] DSD format: DFF (MSB first)");
+                        DEBUG_LOG("[Callback] DSD format: DFF");
                     } else {
-                        // Fallback to codec string if detection failed
                         format.dsdFormat = (trackInfo.codec.find("lsb") != std::string::npos)
                             ? AudioFormat::DSDFormat::DSF
                             : AudioFormat::DSDFormat::DFF;
-                        DEBUG_LOG("[Callback] DSD format: "
-                                  << (format.dsdFormat == AudioFormat::DSDFormat::DSF ? "DSF" : "DFF")
-                                  << " (from codec fallback)");
                     }
                 }
 
-                // Open/resume connection if needed
-                // Check isPlaying() not isOpen() - after stopPlayback(), isOpen() is true
-                // but we still need to call open() to trigger quick resume
-                //
-                // CRITICAL FIX: Also check for format changes!
-                // When transitioning DSD→PCM (or vice versa), DirettaSync may still be
-                // "playing" but with the wrong format. We must call open() to reconfigure.
+                // Check if we need to open/reconfigure
                 bool needsOpen = !m_direttaSync->isPlaying();
 
                 if (!needsOpen && m_direttaSync->isOpen()) {
-                    // Check if format has changed
                     const AudioFormat& currentSyncFormat = m_direttaSync->getFormat();
                     bool formatChanged = (currentSyncFormat.sampleRate != format.sampleRate ||
                                          currentSyncFormat.bitDepth != format.bitDepth ||
@@ -224,14 +210,6 @@ bool DirettaRenderer::start() {
                                          currentSyncFormat.isDSD != format.isDSD);
                     if (formatChanged) {
                         std::cout << "[Callback] FORMAT CHANGE DETECTED!" << std::endl;
-                        std::cout << "[Callback]   Old: " << currentSyncFormat.sampleRate << "Hz/"
-                                  << currentSyncFormat.bitDepth << "bit "
-                                  << (currentSyncFormat.isDSD ? "DSD" : "PCM") << std::endl;
-                        std::cout << "[Callback]   New: " << format.sampleRate << "Hz/"
-                                  << format.bitDepth << "bit "
-                                  << (format.isDSD ? "DSD" : "PCM") << std::endl;
-
-                        // Stop current playback to trigger full reopen
                         m_direttaSync->stopPlayback(true);
                         needsOpen = true;
                     }
@@ -240,70 +218,26 @@ bool DirettaRenderer::start() {
                 if (needsOpen) {
                     if (!m_direttaSync->open(format)) {
                         std::cerr << "[Callback] Failed to open DirettaSync" << std::endl;
-                        return false;
+                        return { AudioCallbackStatus::Stop, 0 };
                     }
 
-                    // Propagate S24 alignment hint AFTER open() completes
                     if (trackInfo.s24Alignment == TrackInfo::S24Alignment::LsbAligned) {
                         m_direttaSync->setS24PackModeHint(DirettaRingBuffer::S24PackMode::LsbAligned);
-                        DEBUG_LOG("[Callback] S24 hint propagated: LsbAligned");
                     } else if (trackInfo.s24Alignment == TrackInfo::S24Alignment::MsbAligned) {
                         m_direttaSync->setS24PackModeHint(DirettaRingBuffer::S24PackMode::MsbAligned);
-                        DEBUG_LOG("[Callback] S24 hint propagated: MsbAligned");
                     }
                 }
 
-                // Send audio (DirettaSync handles all format conversions)
-                if (trackInfo.isDSD) {
-                    // DSD: Atomic send with retry
-                    int retryCount = 0;
-                    const int maxRetries = 100;
-                    size_t sent = 0;
+                // Non-blocking single send attempt
+                size_t written = m_direttaSync->sendAudio(payload.data, payload.samples);
 
-                    while (sent == 0 && retryCount < maxRetries) {
-                        sent = m_direttaSync->sendAudio(buffer.data(), samples);
-
-                        if (sent == 0) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                            retryCount++;
-                        }
-                    }
-
-                    if (sent == 0) {
-                        std::cerr << "[Callback] DSD timeout" << std::endl;
-                    }
-                } else {
-                    // PCM: Incremental send with hybrid flow control
-                    const uint8_t* audioData = buffer.data();
-                    size_t remainingSamples = samples;
-                    size_t bytesPerSample = (bitDepth == 24 || bitDepth == 32)
-                        ? 4 * channels : (bitDepth / 8) * channels;
-
-                    float bufferLevel = m_direttaSync->getBufferLevel();
-                    bool criticalMode = (bufferLevel < FlowControl::CRITICAL_BUFFER_LEVEL);
-
-                    int retryCount = 0;
-
-                    while (remainingSamples > 0 && retryCount < FlowControl::MAX_RETRIES) {
-                        size_t sent = m_direttaSync->sendAudio(audioData, remainingSamples);
-
-                        if (sent > 0) {
-                            size_t samplesConsumed = sent / bytesPerSample;
-                            remainingSamples -= samplesConsumed;
-                            audioData += sent;
-                            retryCount = 0;
-                        } else {
-                            if (criticalMode) {
-                                DEBUG_LOG("[Audio] Early-return, buffer critical: " << bufferLevel);
-                                break;
-                            }
-                            std::this_thread::sleep_for(std::chrono::microseconds(FlowControl::MICROSLEEP_US));
-                            retryCount++;
-                        }
-                    }
+                if (written == 0) {
+                    return { AudioCallbackStatus::Backpressure, 0 };
                 }
-
-                return true;
+                if (written < payload.bytes) {
+                    return { AudioCallbackStatus::Backpressure, written };
+                }
+                return { AudioCallbackStatus::Sent, written };
             }
         );
 
