@@ -83,6 +83,9 @@ private:
 
     // Adaptive chunk sizing based on buffer level
     size_t calculateAdaptiveChunkSize(size_t baseSize, float bufferLevel) const;
+    
+    // Quantized chunk size selection
+    size_t selectChunkSize(uint32_t sampleRate, bool isDSD) const;
 
     // Track URI for gapless S24 hint updates
     std::string m_lastProcessedURI;
