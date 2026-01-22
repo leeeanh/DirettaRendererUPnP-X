@@ -152,6 +152,11 @@ public:
      */
     size_t fillFifo(size_t targetSamples, uint32_t outputRate, uint32_t outputBits);
 
+    /**
+     * @brief Clear FIFO spill state on seek/track change
+     */
+    void resetFifoPending();
+
 private:
     AVFormatContext* m_formatContext;
     AVCodecContext* m_codecContext;
@@ -191,8 +196,6 @@ private:
     AudioBuffer m_fifoPendingBuffer;
     size_t m_fifoPendingBytes = 0;
     size_t m_fifoPendingOffset = 0;
-
-    void resetFifoPending();  // Clear spill state on seek/track change
 
     bool initResampler(uint32_t outputRate, uint32_t outputBits);
     bool canBypass(uint32_t outputRate, uint32_t outputBits) const;
