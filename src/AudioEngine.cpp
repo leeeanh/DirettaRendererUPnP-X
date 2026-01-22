@@ -1104,6 +1104,168 @@ bool AudioDecoder::canBypass(uint32_t outputRate, uint32_t outputBits) const {
     return true;
 }
 
+bool AudioDecoder::ensureFifo(uint32_t outputRate, uint32_t outputBits) {
+    if (m_resamplerInitialized) {
+        return true;
+    }
+    return initResampler(outputRate, outputBits);
+}
+
+void AudioDecoder::resetFifoPending() {
+    m_fifoPendingBytes = 0;
+    m_fifoPendingOffset = 0;
+}
+
+size_t AudioDecoder::fillFifo(size_t targetSamples, uint32_t outputRate, uint32_t outputBits) {
+    if (!m_codecContext || m_eof) {
+        return 0;
+    }
+
+    size_t samplesAdded = 0;
+    size_t bytesPerSample = (outputBits <= 16) ? 2 : 4;
+    bytesPerSample *= m_trackInfo.channels;
+
+    // Ensure resampler/bypass is initialized before decoding into FIFO
+    if (!ensureFifo(outputRate, outputBits)) {
+        return 0;
+    }
+
+    if (!m_pcmFifo) {
+        return 0;
+    }
+
+    size_t currentLevel = av_audio_fifo_size(m_pcmFifo);
+
+    // Flush any pending samples from prior partial FIFO write
+    if (m_fifoPendingBytes > 0) {
+        int space = av_audio_fifo_space(m_pcmFifo);
+        size_t pendingSamples = m_fifoPendingBytes / bytesPerSample;
+        size_t toWrite = std::min<size_t>(pendingSamples, static_cast<size_t>(space));
+        if (toWrite > 0) {
+            uint8_t* data[1] = { m_fifoPendingBuffer.data() + m_fifoPendingOffset };
+            int written = av_audio_fifo_write(m_pcmFifo, (void**)data, toWrite);
+            if (written > 0) {
+                size_t bytesWritten = static_cast<size_t>(written) * bytesPerSample;
+                m_fifoPendingOffset += bytesWritten;
+                m_fifoPendingBytes -= bytesWritten;
+                samplesAdded += written;
+                if (m_fifoPendingBytes == 0) {
+                    m_fifoPendingOffset = 0;
+                }
+            }
+        }
+
+        // If FIFO is still full, defer decoding until next call
+        if (m_fifoPendingBytes > 0) {
+            return samplesAdded;
+        }
+    }
+
+    // Decode frames until we reach target or run out of data
+    while (currentLevel < targetSamples && !m_eof) {
+        // Read and decode one packet
+        if (!m_packet) m_packet = av_packet_alloc();
+        if (!m_frame) m_frame = av_frame_alloc();
+
+        int ret = av_read_frame(m_formatContext, m_packet);
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                m_eof = true;
+            }
+            break;
+        }
+
+        if (m_packet->stream_index != m_audioStreamIndex) {
+            av_packet_unref(m_packet);
+            continue;
+        }
+
+        ret = avcodec_send_packet(m_codecContext, m_packet);
+        av_packet_unref(m_packet);
+        if (ret < 0) break;
+
+        while (ret >= 0) {
+            ret = avcodec_receive_frame(m_codecContext, m_frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) break;
+
+            // Convert frame to output format and add to FIFO
+            if (m_bypassMode) {
+                // Direct: add frame to FIFO
+                int space = av_audio_fifo_space(m_pcmFifo);
+                size_t frameSamples = static_cast<size_t>(m_frame->nb_samples);
+                size_t toWrite = std::min<size_t>(frameSamples, static_cast<size_t>(space));
+
+                if (toWrite > 0) {
+                    uint8_t* data[1] = { m_frame->data[0] };
+                    int written = av_audio_fifo_write(m_pcmFifo, (void**)data, toWrite);
+                    if (written > 0) {
+                        samplesAdded += written;
+                    }
+                    toWrite = static_cast<size_t>(written);
+                }
+
+                // Preserve remainder when FIFO is nearly full
+                if (toWrite < frameSamples) {
+                    size_t remainingSamples = frameSamples - toWrite;
+                    size_t remainingBytes = remainingSamples * bytesPerSample;
+                    m_fifoPendingBuffer.resize(remainingBytes);
+                    std::memcpy(m_fifoPendingBuffer.data(),
+                                m_frame->data[0] + toWrite * bytesPerSample,
+                                remainingBytes);
+                    m_fifoPendingBytes = remainingBytes;
+                    m_fifoPendingOffset = 0;
+                    av_frame_unref(m_frame);
+                    break;
+                }
+            } else if (m_swrContext) {
+                // Resample then add to FIFO
+                int outSamples = swr_get_out_samples(m_swrContext, m_frame->nb_samples);
+                m_resampleBuffer.resize(outSamples * bytesPerSample);
+
+                uint8_t* outData[1] = { m_resampleBuffer.data() };
+                int converted = swr_convert(m_swrContext, outData, outSamples,
+                                           (const uint8_t**)m_frame->data, m_frame->nb_samples);
+
+                if (converted > 0) {
+                    int space = av_audio_fifo_space(m_pcmFifo);
+                    size_t toWrite = std::min<size_t>(static_cast<size_t>(converted),
+                                                       static_cast<size_t>(space));
+
+                    if (toWrite > 0) {
+                        uint8_t* data[1] = { m_resampleBuffer.data() };
+                        int written = av_audio_fifo_write(m_pcmFifo, (void**)data, toWrite);
+                        if (written > 0) {
+                            samplesAdded += written;
+                        }
+                        toWrite = static_cast<size_t>(written);
+                    }
+
+                    // Preserve remainder
+                    if (toWrite < static_cast<size_t>(converted)) {
+                        size_t remainingSamples = converted - toWrite;
+                        size_t remainingBytes = remainingSamples * bytesPerSample;
+                        m_fifoPendingBuffer.resize(remainingBytes);
+                        std::memcpy(m_fifoPendingBuffer.data(),
+                                    m_resampleBuffer.data() + toWrite * bytesPerSample,
+                                    remainingBytes);
+                        m_fifoPendingBytes = remainingBytes;
+                        m_fifoPendingOffset = 0;
+                        av_frame_unref(m_frame);
+                        break;
+                    }
+                }
+            }
+
+            av_frame_unref(m_frame);
+        }
+
+        currentLevel = av_audio_fifo_size(m_pcmFifo);
+    }
+
+    return samplesAdded;
+}
+
 bool AudioDecoder::initResampler(uint32_t outputRate, uint32_t outputBits) {
     // Don't resample DSD!
     if (m_trackInfo.isDSD) {
