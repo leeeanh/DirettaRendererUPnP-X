@@ -512,7 +512,7 @@ full_open:
         int direttaBps = (acceptedBits == 32) ? 4 : (acceptedBits == 24) ? 3 : 2;
         int inputBps = (format.bitDepth == 32 || format.bitDepth == 24) ? 4 : 2;
 
-        configureRingPCM(format.sampleRate, format.channels, direttaBps, inputBps);
+        configureRingPCM(format.sampleRate, format.channels, direttaBps, inputBps, format.isCompressed);
     }
 
     // Pre-allocate fallback buffer for wraparound cases (SDK 148 migration)
@@ -988,14 +988,36 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
     m_framesPerBufferAccumulator.store(0, std::memory_order_release);
     m_bytesPerBuffer.store(framesBase * bytesPerFrame, std::memory_order_release);
 
-    m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, false,
-        m_isLowBitrate.load(std::memory_order_acquire));
-    m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
+    // Aligned prefill calculation
+    size_t bytesPerBufferVal = m_bytesPerBuffer.load(std::memory_order_acquire);
+    m_prefillTargetBuffers = calculateAlignedPrefill(
+        bytesPerSecond, false, isCompressed, bytesPerBufferVal);
+
+    // Handle fractional frame remainder for non-standard rates
+    if (framesRemainder == 0) {
+        m_prefillTarget = m_prefillTargetBuffers * bytesPerBufferVal;
+    } else {
+        // Compute the sum of the next N callback sizes to stay on true boundaries
+        size_t totalBytes = 0;
+        uint32_t acc = 0;
+        for (size_t i = 0; i < m_prefillTargetBuffers; ++i) {
+            size_t bytesThis = bytesPerBufferVal;
+            acc += static_cast<uint32_t>(framesRemainder);
+            if (acc >= 1000) {
+                acc -= 1000;
+                bytesThis += static_cast<size_t>(bytesPerFrame);
+            }
+            totalBytes += bytesThis;
+        }
+        m_prefillTarget = totalBytes;
+    }
     m_prefillComplete = false;
 
     DIRETTA_LOG("Ring PCM: " << rate << "Hz " << channels << "ch "
                 << direttaBps << "bps, buffer=" << ringSize
-                << ", prefill=" << m_prefillTarget);
+                << ", prefill=" << m_prefillTargetBuffers << " buffers ("
+                << m_prefillTarget << " bytes, "
+                << (isCompressed ? "compressed" : "uncompressed") << ")");
 
     // Increment format generation to invalidate cached values
     m_formatGeneration.fetch_add(1, std::memory_order_release);
