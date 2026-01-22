@@ -372,6 +372,19 @@ private:
     int m_silenceCount;  // Pour drainage du buffer Diretta
     bool m_isDraining;   // Flag pour éviter de re-logger "Track finished"
 
+    // Jitter buffer state
+    size_t m_jitterTargetSamples{0};    // Target fill level (samples)
+    size_t m_jitterMinSamples{0};       // Minimum before underrun warning
+    bool m_jitterBufferReady{false};    // True when target reached
+
+    // Pending output state (backpressure)
+    size_t m_pendingBytes{0};           // Pending output bytes
+    size_t m_pendingByteOffset{0};      // Byte offset into m_outputBuffer
+    size_t m_pendingSamples{0};         // Pending samples
+
+    // Pre-allocated output buffer (uses aligned AudioBuffer)
+    AudioBuffer m_outputBuffer;
+
     // Helper functions
     bool openCurrentTrack();
     bool preloadNextTrack();
