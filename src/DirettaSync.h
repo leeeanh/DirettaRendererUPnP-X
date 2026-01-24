@@ -268,8 +268,9 @@ private:
 
     void configureSinkPCM(int rate, int channels, int inputBits, int& acceptedBits);
     void configureSinkDSD(uint32_t dsdBitRate, int channels, const AudioFormat& format);
-    void configureRingPCM(int rate, int channels, int direttaBps, int inputBps);
+    void configureRingPCM(int rate, int channels, int direttaBps, int inputBps, bool isCompressed);
     void configureRingDSD(uint32_t byteRate, int channels);
+    size_t calculateAlignedPrefill(size_t bytesPerSecond, bool isDSD, bool isCompressed, size_t bytesPerBuffer);
     bool beginReconfigure();
     void endReconfigure();
     bool waitForPendingRelease(std::chrono::milliseconds timeout);
@@ -381,6 +382,7 @@ private:
 
     // Prefill and stabilization
     size_t m_prefillTarget = 0;
+    size_t m_prefillTargetBuffers = 0;  // Prefill in whole buffer count
     std::atomic<bool> m_prefillComplete{false};
     std::atomic<bool> m_postOnlineDelayDone{false};
     std::atomic<int> m_silenceBuffersRemaining{0};

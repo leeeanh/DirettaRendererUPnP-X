@@ -7,6 +7,7 @@
 #include <iostream>
 #include <thread>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include "memcpyfast_audio.h"
 
@@ -21,12 +22,13 @@ extern bool g_verbose;
 }
 
 // ============================================================================
-// AudioBuffer
+// AudioBuffer - Grow-only, 64-byte aligned
 // ============================================================================
 
 AudioBuffer::AudioBuffer(size_t size)
     : m_data(nullptr)
     , m_size(0)
+    , m_capacity(0)
 {
     if (size > 0) {
         resize(size);
@@ -35,35 +37,65 @@ AudioBuffer::AudioBuffer(size_t size)
 
 AudioBuffer::~AudioBuffer() {
     if (m_data) {
-        delete[] m_data;
+        std::free(m_data);  // Required for aligned_alloc memory
     }
 }
 
 AudioBuffer::AudioBuffer(AudioBuffer&& other) noexcept
     : m_data(other.m_data)
     , m_size(other.m_size)
+    , m_capacity(other.m_capacity)
 {
     other.m_data = nullptr;
     other.m_size = 0;
+    other.m_capacity = 0;
 }
 
 AudioBuffer& AudioBuffer::operator=(AudioBuffer&& other) noexcept {
     if (this != &other) {
-        delete[] m_data;
+        std::free(m_data);
         m_data = other.m_data;
         m_size = other.m_size;
+        m_capacity = other.m_capacity;
         other.m_data = nullptr;
         other.m_size = 0;
+        other.m_capacity = 0;
     }
     return *this;
 }
 
 void AudioBuffer::resize(size_t size) {
-    if (m_data) {
-        delete[] m_data;
+    if (size > m_capacity) {
+        growCapacity(size);
     }
     m_size = size;
-    m_data = new uint8_t[size];
+}
+
+void AudioBuffer::ensureCapacity(size_t cap) {
+    if (cap > m_capacity) {
+        growCapacity(cap);
+    }
+}
+
+void AudioBuffer::growCapacity(size_t needed) {
+    // Grow by 1.5x to reduce future reallocations
+    size_t newCapacity = std::max(needed, m_capacity + m_capacity / 2);
+    // Round up to alignment boundary
+    newCapacity = (newCapacity + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+    uint8_t* newData = static_cast<uint8_t*>(std::aligned_alloc(ALIGNMENT, newCapacity));
+    if (!newData) {
+        throw std::bad_alloc();
+    }
+
+    // Copy existing data
+    if (m_data && m_size > 0) {
+        std::memcpy(newData, m_data, m_size);
+    }
+
+    std::free(m_data);
+    m_data = newData;
+    m_capacity = newCapacity;
 }
 
 // ============================================================================
@@ -1685,7 +1717,8 @@ bool AudioEngine::preloadNextTrack() {
         nextInfo.sampleRate != m_currentTrackInfo.sampleRate ||
         nextInfo.bitDepth != m_currentTrackInfo.bitDepth ||
         nextInfo.channels != m_currentTrackInfo.channels ||
-        nextInfo.isDSD != m_currentTrackInfo.isDSD
+        nextInfo.isDSD != m_currentTrackInfo.isDSD ||
+        nextInfo.isCompressed != m_currentTrackInfo.isCompressed
     );
 
     if (formatWillChange) {

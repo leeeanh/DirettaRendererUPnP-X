@@ -7,6 +7,7 @@
  */
 
 #include "DirettaSync.h"
+#include "AudioTiming.h"
 #include <stdexcept>
 #include <iomanip>
 
@@ -329,7 +330,8 @@ bool DirettaSync::open(const AudioFormat& format) {
         bool sameFormat = (m_previousFormat.sampleRate == format.sampleRate &&
                           m_previousFormat.bitDepth == format.bitDepth &&
                           m_previousFormat.channels == format.channels &&
-                          m_previousFormat.isDSD == format.isDSD);
+                          m_previousFormat.isDSD == format.isDSD &&
+                          m_previousFormat.isCompressed == format.isCompressed);
 
         std::cout << "[DirettaSync]   Previous: " << m_previousFormat.sampleRate << "Hz/"
                   << m_previousFormat.bitDepth << "bit/" << m_previousFormat.channels << "ch"
@@ -409,7 +411,7 @@ bool DirettaSync::open(const AudioFormat& format) {
         int direttaBps = (acceptedBits == 32) ? 4 : (acceptedBits == 24) ? 3 : 2;
         int inputBps = (format.bitDepth == 32 || format.bitDepth == 24) ? 4 : 2;
 
-        configureRingPCM(format.sampleRate, format.channels, direttaBps, inputBps);
+        configureRingPCM(format.sampleRate, format.channels, direttaBps, inputBps, format.isCompressed);
     }
 
     unsigned int cycleTimeUs = calculateCycleTime(effectiveSampleRate, effectiveChannels, bitsPerSample);
@@ -785,7 +787,33 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
 // Ring Buffer Configuration
 //=============================================================================
 
-void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int inputBps) {
+size_t DirettaSync::calculateAlignedPrefill(size_t bytesPerSecond, bool isDSD,
+                                             bool isCompressed, size_t bytesPerBuffer) {
+    // Target fill based on format complexity
+    int targetMs = isCompressed ? AudioTiming::JITTER_TARGET_COMPRESSED
+                                : AudioTiming::JITTER_TARGET_UNCOMPRESSED;
+
+    // DSD uses fixed 150ms (not affected by compression flag)
+    if (isDSD) {
+        targetMs = 150;
+    }
+
+    // Convert to bytes
+    size_t targetBytes = (bytesPerSecond * targetMs) / 1000;
+
+    // Align UP to whole buffer boundary
+    size_t targetBuffers = (targetBytes + bytesPerBuffer - 1) / bytesPerBuffer;
+
+    // Clamp to reasonable bounds (min 8 buffers, max 1/4 ring)
+    size_t ringSize = m_ringBuffer.size();
+    size_t maxBuffers = ringSize / (4 * bytesPerBuffer);
+    targetBuffers = std::max(targetBuffers, size_t{8});
+    targetBuffers = std::min(targetBuffers, maxBuffers);
+
+    return targetBuffers;
+}
+
+void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int inputBps, bool isCompressed) {
     std::lock_guard<std::mutex> lock(m_configMutex);
     ReconfigureGuard guard(*this);
     if (!guard.active()) {
@@ -818,9 +846,30 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
     m_framesPerBufferAccumulator.store(0, std::memory_order_release);
     m_bytesPerBuffer.store(framesBase * bytesPerFrame, std::memory_order_release);
 
-    m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, false,
-        m_isLowBitrate.load(std::memory_order_acquire));
-    m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
+    size_t bytesPerBuffer = m_bytesPerBuffer.load(std::memory_order_acquire);
+
+    // Aligned prefill calculation
+    m_prefillTargetBuffers = calculateAlignedPrefill(
+        bytesPerSecond, false, isCompressed, bytesPerBuffer);
+
+    // Compute exact prefill bytes accounting for fractional frame accumulation
+    if (framesRemainder == 0) {
+        m_prefillTarget = m_prefillTargetBuffers * bytesPerBuffer;
+    } else {
+        // Compute the sum of the next N callback sizes to stay on true boundaries
+        size_t totalBytes = 0;
+        uint32_t acc = 0;
+        for (size_t i = 0; i < m_prefillTargetBuffers; ++i) {
+            size_t bytesThis = bytesPerBuffer;
+            acc += static_cast<uint32_t>(framesRemainder);
+            if (acc >= 1000) {
+                acc -= 1000;
+                bytesThis += static_cast<size_t>(bytesPerFrame);
+            }
+            totalBytes += bytesThis;
+        }
+        m_prefillTarget = totalBytes;
+    }
     m_prefillComplete = false;
 
     // Pre-allocate silence buffer for max possible bytes per callback
@@ -831,7 +880,9 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
 
     DIRETTA_LOG("Ring PCM: " << rate << "Hz " << channels << "ch "
                 << direttaBps << "bps, buffer=" << ringSize
-                << ", prefill=" << m_prefillTarget);
+                << ", prefill=" << m_prefillTargetBuffers << " buffers ("
+                << m_prefillTarget << " bytes, "
+                << (isCompressed ? "compressed" : "uncompressed") << ")");
 
     // Increment format generation to invalidate cached values
     m_formatGeneration.fetch_add(1, std::memory_order_release);
@@ -867,8 +918,10 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     m_framesPerBufferRemainder.store(0, std::memory_order_release);
     m_framesPerBufferAccumulator.store(0, std::memory_order_release);
 
-    m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, true, false);
-    m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
+    // Aligned prefill calculation (DSD always uses 150ms)
+    m_prefillTargetBuffers = calculateAlignedPrefill(
+        bytesPerSecond, true, false, bytesPerBuffer);
+    m_prefillTarget = m_prefillTargetBuffers * bytesPerBuffer;
     m_prefillComplete = false;
 
     // Pre-allocate silence buffer for DSD
@@ -878,7 +931,9 @@ void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     }
 
     DIRETTA_LOG("Ring DSD: byteRate=" << byteRate << " ch=" << channels
-                << " buffer=" << ringSize << " prefill=" << m_prefillTarget);
+                << " buffer=" << ringSize
+                << " prefill=" << m_prefillTargetBuffers << " buffers ("
+                << m_prefillTarget << " bytes)");
 
     // Increment format generation to invalidate cached values
     m_formatGeneration.fetch_add(1, std::memory_order_release);

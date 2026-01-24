@@ -48,6 +48,9 @@ struct TrackInfo {
 
 /**
  * @brief Audio buffer for streaming
+ *
+ * Grow-only, 64-byte aligned buffer optimized for AVX-512 operations.
+ * Eliminates hot-path allocations by reusing capacity.
  */
 class AudioBuffer {
 public:
@@ -62,14 +65,22 @@ public:
     AudioBuffer(AudioBuffer&& other) noexcept;
     AudioBuffer& operator=(AudioBuffer&& other) noexcept;
 
-    void resize(size_t size);
+    // New: separate capacity from logical size
+    void resize(size_t size);           // Sets logical size, grows capacity if needed
+    void ensureCapacity(size_t cap);    // Pre-allocate without changing logical size
+
     size_t size() const { return m_size; }
+    size_t capacity() const { return m_capacity; }
     uint8_t* data() { return m_data; }
     const uint8_t* data() const { return m_data; }
 
 private:
-    uint8_t* m_data;
-    size_t m_size;
+    uint8_t* m_data = nullptr;
+    size_t m_size = 0;
+    size_t m_capacity = 0;
+
+    static constexpr size_t ALIGNMENT = 64;  // AVX-512 cacheline
+    void growCapacity(size_t needed);
 };
 
 /**

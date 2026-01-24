@@ -10,6 +10,7 @@
 #include "DirettaRingBuffer.h"
 #include "UPnPDevice.hpp"
 #include "AudioEngine.h"
+#include "AudioTiming.h"
 #include <chrono>
 #include <ctime>
 #include <iomanip>
@@ -220,7 +221,8 @@ bool DirettaRenderer::start() {
                     bool formatChanged = (currentSyncFormat.sampleRate != format.sampleRate ||
                                          currentSyncFormat.bitDepth != format.bitDepth ||
                                          currentSyncFormat.channels != format.channels ||
-                                         currentSyncFormat.isDSD != format.isDSD);
+                                         currentSyncFormat.isDSD != format.isDSD ||
+                                         currentSyncFormat.isCompressed != format.isCompressed);
                     if (formatChanged) {
                         std::cout << "[Callback] FORMAT CHANGE DETECTED!" << std::endl;
                         std::cout << "[Callback]   Old: " << currentSyncFormat.sampleRate << "Hz/"
@@ -542,37 +544,22 @@ void DirettaRenderer::upnpThreadFunc() {
     DEBUG_LOG("[UPnP Thread] Stopped");
 }
 
-size_t DirettaRenderer::calculateAdaptiveChunkSize(size_t baseSize, float bufferLevel) const {
-    constexpr float TARGET_LEVEL = 0.50f;
-    constexpr float DEADBAND = 0.10f;
-    constexpr float MIN_SCALE = 0.25f;
-    constexpr float MAX_SCALE = 1.50f;
-
-    float scale = 1.0f;
-    float deviation = bufferLevel - TARGET_LEVEL;
-
-    if (deviation > DEADBAND) {
-        // Buffer too full - reduce chunk size
-        scale = 1.0f - ((deviation - DEADBAND) / (1.0f - TARGET_LEVEL - DEADBAND));
-        scale = std::max(scale, MIN_SCALE);
-    } else if (deviation < -DEADBAND) {
-        // Buffer too empty - increase chunk size
-        scale = 1.0f + ((-deviation - DEADBAND) / (TARGET_LEVEL - DEADBAND)) * 0.5f;
-        scale = std::min(scale, MAX_SCALE);
-    }
-
-    return static_cast<size_t>(baseSize * scale);
+size_t DirettaRenderer::selectChunkSize(uint32_t sampleRate, bool isDSD) const {
+    if (isDSD) return AudioTiming::DSD_CHUNK;
+    if (sampleRate <= 48000) return AudioTiming::PCM_CHUNK_LOW;
+    if (sampleRate <= 96000) return AudioTiming::PCM_CHUNK_MID;
+    return AudioTiming::PCM_CHUNK_HIGH;
 }
 
 void DirettaRenderer::audioThreadFunc() {
     DEBUG_LOG("[Audio Thread] Started");
 
-    // Buffer-level flow control thresholds (like MPD's Delay() approach)
-    constexpr float BUFFER_HIGH_THRESHOLD = 0.5f;  // Throttle when >50% full
-    constexpr float BUFFER_LOW_THRESHOLD = 0.25f;  // Warn when <25% full
+    using Clock = std::chrono::steady_clock;
 
+    Clock::time_point nextWake = Clock::now();
+    size_t currentChunk = 0;
     uint32_t lastSampleRate = 0;
-    size_t currentSamplesPerCall = 8192;
+    std::chrono::microseconds period{0};
 
     while (m_running) {
         if (!m_audioEngine) {
@@ -582,57 +569,46 @@ void DirettaRenderer::audioThreadFunc() {
 
         auto state = m_audioEngine->getState();
 
-        if (state == AudioEngine::State::PLAYING) {
-            const auto& trackInfo = m_audioEngine->getCurrentTrackInfo();
-            uint32_t sampleRate = trackInfo.sampleRate;
-            bool isDSD = trackInfo.isDSD;
-
-            if (sampleRate == 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;
-            }
-
-            // Adjust samples per call based on format
-            size_t baseSamplesPerCall = isDSD ? 32768 : 8192;
-
-            // Buffer-level flow control (MPD-style)
-            // Only throttle if DirettaSync is actively playing
-            // If not playing (after stop), bufferLevel stays 0 so we call process()
-            // which triggers the open/quick-resume path in the audio callback
-            float bufferLevel = 0.0f;
-            if (m_direttaSync && m_direttaSync->isPlaying()) {
-                bufferLevel = m_direttaSync->getBufferLevel();
-            }
-
-            // Apply adaptive sizing based on buffer level
-            size_t samplesPerCall = calculateAdaptiveChunkSize(baseSamplesPerCall, bufferLevel);
-
-            if (sampleRate != lastSampleRate || samplesPerCall != currentSamplesPerCall) {
-                currentSamplesPerCall = samplesPerCall;
-                lastSampleRate = sampleRate;
-                DEBUG_LOG("[Audio Thread] Format: " << sampleRate << "Hz "
-                          << (isDSD ? "DSD" : "PCM") << ", samples/call="
-                          << currentSamplesPerCall);
-            }
-
-            if (bufferLevel > BUFFER_HIGH_THRESHOLD) {
-                // Buffer is healthy - throttle to avoid wasting CPU
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            } else {
-                // Buffer needs filling - process immediately
-                bool success = m_audioEngine->process(currentSamplesPerCall);
-
-                if (!success) {
-                    // No data available from decoder, brief pause
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                } else if (bufferLevel < BUFFER_LOW_THRESHOLD && bufferLevel > 0.0f) {
-                    // Buffer is getting low - process again immediately (catch up)
-                    m_audioEngine->process(currentSamplesPerCall);
-                }
-            }
-        } else {
+        if (state != AudioEngine::State::PLAYING) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            nextWake = Clock::now();  // Reset on state change
             lastSampleRate = 0;
+            continue;
+        }
+
+        const auto& trackInfo = m_audioEngine->getCurrentTrackInfo();
+        uint32_t sampleRate = trackInfo.sampleRate;
+
+        if (sampleRate == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // Recalculate period only when format changes
+        if (sampleRate != lastSampleRate) {
+            currentChunk = selectChunkSize(sampleRate, trackInfo.isDSD);
+            period = std::chrono::microseconds(
+                (currentChunk * 1000000ULL) / sampleRate
+            );
+            lastSampleRate = sampleRate;
+            nextWake = Clock::now();  // Reset cadence
+
+            DEBUG_LOG("[Audio Thread] Format: " << sampleRate << "Hz "
+                      << (trackInfo.isDSD ? "DSD" : "PCM")
+                      << ", chunk=" << currentChunk
+                      << ", period=" << period.count() << "us");
+        }
+
+        // Steady cadence: process then sleep until next wake
+        m_audioEngine->process(currentChunk);
+
+        nextWake += period;
+        auto now = Clock::now();
+        if (nextWake > now) {
+            std::this_thread::sleep_until(nextWake);
+        } else {
+            // Running late - skip sleep, catch up
+            nextWake = now;
         }
     }
 
