@@ -962,6 +962,10 @@ bool DirettaSync::startPlayback() {
 void DirettaSync::stopPlayback(bool immediate) {
     if (!m_playing) return;
 
+    // Set stop flag FIRST to prevent further underrun counting
+    // getNewStream() checks this flag before counting underruns
+    m_stopRequested = true;
+
     // Report accumulated underruns (moved from hot path)
     uint32_t underruns = m_underrunCount.exchange(0, std::memory_order_relaxed);
     if (underruns > 0) {
@@ -1106,6 +1110,7 @@ size_t DirettaSync::sendAudio(const uint8_t* data, size_t numSamples) {
 
     // Check prefill completion
     if (written > 0) {
+        m_underrunActive.store(false, std::memory_order_release);
         if (!m_prefillComplete.load(std::memory_order_acquire)) {
             if (m_ringBuffer.getAvailable() >= m_prefillTarget) {
                 m_prefillComplete = true;
@@ -1184,6 +1189,7 @@ bool DirettaSync::getNewStream(diretta_stream& stream) {
 
     RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
     if (!ringGuard.active()) {
+        m_underrunActive.store(false, std::memory_order_release);
         fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
@@ -1192,6 +1198,7 @@ bool DirettaSync::getNewStream(diretta_stream& stream) {
     // Shutdown silence
     int silenceRemaining = m_silenceBuffersRemaining.load(std::memory_order_acquire);
     if (silenceRemaining > 0) {
+        m_underrunActive.store(false, std::memory_order_release);
         fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_silenceBuffersRemaining.fetch_sub(1, std::memory_order_acq_rel);
         m_workerActive = false;
@@ -1200,6 +1207,7 @@ bool DirettaSync::getNewStream(diretta_stream& stream) {
 
     // Stop requested
     if (m_stopRequested.load(std::memory_order_acquire)) {
+        m_underrunActive.store(false, std::memory_order_release);
         fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
@@ -1207,6 +1215,7 @@ bool DirettaSync::getNewStream(diretta_stream& stream) {
 
     // Prefill not complete
     if (!m_prefillComplete.load(std::memory_order_acquire)) {
+        m_underrunActive.store(false, std::memory_order_release);
         fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
@@ -1220,6 +1229,7 @@ bool DirettaSync::getNewStream(diretta_stream& stream) {
             m_stabilizationCount = 0;
             DIRETTA_LOG("Post-online stabilization complete");
         }
+        m_underrunActive.store(false, std::memory_order_release);
         fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
@@ -1231,11 +1241,14 @@ bool DirettaSync::getNewStream(diretta_stream& stream) {
     size_t avail = m_ringBuffer.getAvailable();
     if (avail < static_cast<size_t>(currentBytesPerBuffer)) {
         // True underrun - don't advance, just silence
-        m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+        if (!m_underrunActive.exchange(true, std::memory_order_acq_rel)) {
+            m_underrunCount.fetch_add(1, std::memory_order_relaxed);
+        }
         fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
         m_workerActive = false;
         return true;
     }
+    m_underrunActive.store(false, std::memory_order_release);
 
     if (g_verbose && (count <= 5 || count % 5000 == 0)) {
         size_t currentRingSize = m_ringBuffer.size();
@@ -1256,9 +1269,16 @@ bool DirettaSync::getNewStream(diretta_stream& stream) {
         // Defer advance to next callback (SDK reads asynchronously)
         m_pendingAdvance.store(static_cast<size_t>(currentBytesPerBuffer), std::memory_order_release);
     } else {
-        // Wrap (data available but not contiguous) - advance to realign
-        m_ringBuffer.advanceReadPos(static_cast<size_t>(currentBytesPerBuffer));
-        fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
+        // Wrap case: data available but spans wrap point - copy to staging buffer
+        // pop() handles the two-part copy across wrap boundary
+        size_t popped = m_ringBuffer.pop(m_silenceBuffer.data(), static_cast<size_t>(currentBytesPerBuffer));
+        if (popped == static_cast<size_t>(currentBytesPerBuffer)) {
+            stream.Data.P = m_silenceBuffer.data();
+            stream.Size = static_cast<unsigned long long>(currentBytesPerBuffer);
+        } else {
+            // Unexpected: not enough data (should have been caught by underrun check)
+            fillSilence(stream, currentBytesPerBuffer, currentSilenceByte);
+        }
     }
 
     m_workerActive = false;

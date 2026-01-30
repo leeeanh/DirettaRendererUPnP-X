@@ -330,6 +330,7 @@ private:
     std::atomic<bool> m_reconfiguring{false};
     mutable std::atomic<int> m_ringUsers{0};
     std::atomic<uint32_t> m_underrunCount{0};
+    std::atomic<bool> m_underrunActive{false};
 
     // SDK 148 zero-copy state
     std::atomic<size_t> m_pendingAdvance{0};  // Deferred read position advance
